@@ -5,6 +5,7 @@ use std::hash::{Hasher, Hash};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::collections::hash_map::DefaultHasher;
+use std::io::Read;
 
 pub fn ensure_dir(path: impl AsRef<Path>) -> Result<()> {
     fs::create_dir_all(path.as_ref()).with_context(|| format!("create_dir_all {}", path.as_ref().display()))
@@ -90,3 +91,106 @@ pub fn open_reader(path: impl AsRef<Path>) -> Result<BufReader<File>> {
     let file = File::open(path)?;
     Ok(BufReader::new(file))
 }
+
+// ============== Pluggable IO: Sources & Formats & Sinks (minimal skeleton) ==============
+
+#[derive(Clone)]
+pub struct Split {
+    pub uri: String,
+    pub byte_range: Option<(u64, u64)>,
+    pub meta: Option<serde_json::Value>,
+}
+
+pub trait Source: Send + Sync {
+    fn list_splits(&self, input: &str) -> Result<Vec<Split>>;
+    fn open_split(&self, split: &Split) -> Result<Box<dyn Read + Send>>;
+}
+
+pub trait Format<I>: Send + Sync + 'static {
+    fn decode<'a>(&self, r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = I> + Send + 'a>>;
+}
+
+pub trait Sink: Send + Sync {
+    fn open_partition(&self, partition_index: usize) -> Result<Box<dyn std::io::Write + Send>>;
+}
+
+// Local FS implementations
+pub struct LocalFsSource;
+impl Source for LocalFsSource {
+    fn list_splits(&self, input: &str) -> Result<Vec<Split>> {
+        let mut paths = list_files_recursive(input)?;
+        paths.sort();
+        Ok(paths.into_iter().map(|p| Split { uri: p.to_string_lossy().to_string(), byte_range: None, meta: None }).collect())
+    }
+    fn open_split(&self, split: &Split) -> Result<Box<dyn Read + Send>> {
+        let f = File::open(&split.uri)?;
+        Ok(Box::new(f))
+    }
+}
+
+pub struct TextLineFormat;
+impl Format<String> for TextLineFormat {
+    fn decode<'a>(&self, r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = String> + Send + 'a>> {
+        let reader = BufReader::new(r);
+        Ok(Box::new(reader.lines().filter_map(|l| l.ok())))
+    }
+}
+
+pub struct LocalFsSink { pub base: String }
+impl Sink for LocalFsSink {
+    fn open_partition(&self, partition_index: usize) -> Result<Box<dyn std::io::Write + Send>> {
+        let path = format!("{}/part-{:05}.tsv", self.base, partition_index);
+        let w = open_writer(path)?;
+        Ok(Box::new(w))
+    }
+}
+
+// S3 source (read-only): list objects and open via blocking client
+#[derive(Clone)]
+pub struct S3Source { pub bucket: String, pub prefix: String, pub region: String }
+
+impl S3Source {
+    pub fn from_uri(uri: &str) -> Result<Self> {
+        // Expect s3://bucket/prefix...
+        let rest = uri.strip_prefix("s3://").context("s3 uri must start with s3://")?;
+        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+        Ok(Self { bucket: bucket.to_string(), prefix: prefix.to_string(), region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()) })
+    }
+}
+
+impl Source for S3Source {
+    fn list_splits(&self, input: &str) -> Result<Vec<Split>> {
+        let me = if input.starts_with("s3://") { Self::from_uri(input)? } else { self.clone() };
+        let rt = tokio::runtime::Runtime::new()?;
+        let out: Vec<Split> = rt.block_on(async move {
+            let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let client = aws_sdk_s3::Client::new(&conf);
+            let mut splits = Vec::new();
+            let mut cont: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&me.bucket).prefix(&me.prefix);
+                if let Some(token) = cont.clone() { req = req.continuation_token(token); }
+                let resp = req.send().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                for obj in resp.contents() { if let Some(key) = obj.key() { splits.push(Split { uri: format!("s3://{}/{}", me.bucket, key), byte_range: None, meta: None }); } }
+                cont = resp.next_continuation_token().map(|s| s.to_string());
+                if cont.is_none() { break; }
+            }
+            Ok::<_, anyhow::Error>(splits)
+        })?;
+        Ok(out)
+    }
+    fn open_split(&self, split: &Split) -> Result<Box<dyn Read + Send>> {
+        let key_full = split.uri.strip_prefix("s3://").unwrap_or(&split.uri);
+        let (_bucket, key) = key_full.split_once('/').unwrap_or((&self.bucket, key_full));
+        let rt = tokio::runtime::Runtime::new()?;
+        let data = rt.block_on(async move {
+            let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let client = aws_sdk_s3::Client::new(&conf);
+            let resp = client.get_object().bucket(&self.bucket).key(key).send().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let bytes = resp.body.collect().await.map_err(|e| anyhow::anyhow!(e.to_string()))?.into_bytes();
+            Ok::<_, anyhow::Error>(bytes)
+        })?;
+        Ok(Box::new(std::io::Cursor::new(data)))
+    }
+}
+

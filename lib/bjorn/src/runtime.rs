@@ -1,5 +1,6 @@
 use crate::api::{ExecutablePipeline, Mapper, Reducer};
-use crate::io::{ensure_dir, hash_to_partition, list_files_recursive, open_reader, open_writer, read_lines, write_bin, read_bin_line, decode_bin, write_tsv};
+use crate::io::{ensure_dir, hash_to_partition, list_files_recursive, open_reader, open_writer, write_bin, read_bin_line, write_tsv,
+    LocalFsSource, TextLineFormat, S3Source, Split, Source, Format};
 use crate::slurm::SlurmEnv;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -117,11 +118,18 @@ impl ExecutablePipeline for RuntimePipeline {
             ensure_dir(&output_dir)?;
         }
 
-        // inputs
-        let mut all_files = Vec::new();
+        // inputs -> splits (local or s3)
+        let mut all_splits: Vec<Split> = Vec::new();
         for inp in &self.inputs {
-            let mut files = list_files_recursive(inp)?;
-            all_files.append(&mut files);
+            if inp.starts_with("s3://") {
+                let src = S3Source::from_uri(inp)?;
+                let mut splits = src.list_splits(inp)?;
+                all_splits.append(&mut splits);
+            } else {
+                let src = LocalFsSource;
+                let mut splits = src.list_splits(inp)?;
+                all_splits.append(&mut splits);
+            }
         }
 
         // Determine task topology
@@ -133,11 +141,18 @@ impl ExecutablePipeline for RuntimePipeline {
                 .max(1)
         } else { 1 };
         let global_ntasks_raw = if is_slurm { slurm.ntasks.max(1) * local_subtasks } else { slurm.ntasks.max(1) };
-        let global_ntasks = global_ntasks_raw.min(all_files.len().max(1));
+        let global_ntasks = global_ntasks_raw.min(all_splits.len().max(1));
 
         // partition files among logical tasks
-        let chunks: Vec<Vec<PathBuf>> = (0..global_ntasks)
-            .map(|i| all_files.iter().cloned().enumerate().filter(|(idx, _)| idx % global_ntasks == i).map(|(_, p)| p).collect())
+        let chunks: Vec<Vec<Split>> = (0..global_ntasks)
+            .map(|i| {
+                all_splits
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| idx % global_ntasks == i)
+                    .map(|(_, p)| p.clone())
+                    .collect()
+            })
             .collect();
 
         let mapper = Arc::new(mapper);
@@ -164,8 +179,8 @@ impl ExecutablePipeline for RuntimePipeline {
         let map_phase_start = Instant::now();
         let run_map_for = |task_id: usize| {
             let task_start = Instant::now();
-            let files = &chunks[task_id];
-            debug!(task_id, num_files = files.len(), writers = num_reducers, "map task starting");
+            let splits = &chunks[task_id];
+            debug!(task_id, num_files = splits.len(), writers = num_reducers, "map task starting");
             // thread-local batching buffers per partition
             let mut local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
             const LOCAL_BATCH_BYTES: usize = 256 * 1024; // 256KB per partition chunk
@@ -182,8 +197,14 @@ impl ExecutablePipeline for RuntimePipeline {
                 }
             };
 
-            let mut process_one_file = |file: &PathBuf, local_buffers: &mut Vec<Vec<u8>>| {
-                let lines = match read_lines(file) { Ok(it) => it, Err(e) => { error!("read_lines {}: {}", file.display(), e); return; } };
+            let text_format = TextLineFormat;
+            let mut process_one_file = |split: &Split, local_buffers: &mut Vec<Vec<u8>>| {
+                let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
+                    match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+                } else {
+                    match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+                };
+                let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
                 let mut emit = |k: M::Key, v: M::Value| {
                     let emit_start = Instant::now();
                     let part = hash_to_partition(&k, num_reducers);
@@ -201,15 +222,20 @@ impl ExecutablePipeline for RuntimePipeline {
                     total_emit_time += emit_start.elapsed();
                 };
                 let _do_map_start = Instant::now();
-                mapper.do_map(lines.filter_map(|r| r.ok()), &mut emit);
+                mapper.do_map(lines_iter, &mut emit);
             };
 
             if is_slurm {
                 // Parallelize within this task across files when under Slurm (use available cpus-per-task)
-                files.par_iter().for_each(|file| {
+                splits.par_iter().for_each(|split| {
                     let mut thread_local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
-                    // Process file with a local emit that uses local buffers
-                    let lines = match read_lines(file) { Ok(it) => it, Err(e) => { error!("read_lines {}: {}", file.display(), e); return; } };
+                    // Process split with a local emit that uses local buffers
+                    let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
+                        match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+                    } else {
+                        match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+                    };
+                    let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
                     let mut emit = |k: M::Key, v: M::Value| {
                         let part = hash_to_partition(&k, num_reducers);
                         let buf = &mut thread_local_buffers[part];
@@ -225,7 +251,7 @@ impl ExecutablePipeline for RuntimePipeline {
                             if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
                         }
                     };
-                    mapper.do_map(lines.filter_map(|r| r.ok()), &mut emit);
+                    mapper.do_map(lines_iter, &mut emit);
                     // flush per-thread buffers
                     for part in 0..num_reducers {
                         if !thread_local_buffers[part].is_empty() {
@@ -235,7 +261,7 @@ impl ExecutablePipeline for RuntimePipeline {
                     }
                 });
             } else {
-                for file in files { process_one_file(file, &mut local_buffers); }
+                for split in splits { process_one_file(split, &mut local_buffers); }
             }
             // flush remaining buffers
             for part in 0..num_reducers { flush_part(part, &writer_pool, &mut local_buffers); }
@@ -247,7 +273,7 @@ impl ExecutablePipeline for RuntimePipeline {
             let mut guard = map_stats.lock().unwrap();
             guard.push(MapTaskStats {
                 task_id,
-                num_files: files.len() as u64,
+                num_files: splits.len() as u64,
                 total_emits,
                 total_bytes_out,
                 total_flushes,

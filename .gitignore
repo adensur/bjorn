@@ -7,3 +7,4 @@ external_repos/
 *.err
 *.out
 *.tsv
+*.txt

@@ -4,6 +4,7 @@ use crate::io::{ensure_dir, hash_to_partition, open_writer, read_bin_line,
 use crate::sort::external_sort_by_key;
 use crate::stats::StatsCollector;
 use crate::slurm::SlurmEnv;
+use crate::utils::detect_env_or_local;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs;
@@ -12,8 +13,8 @@ use memmap2::Mmap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, debug};
-use crate::writer::{WriterPool, WriterJoiner};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::writer::WriterPool;
+use std::time::{Duration, Instant};
 
 // moved to inner section below
 
@@ -42,12 +43,7 @@ impl ExecutablePipeline for RuntimePipeline {
         R: Reducer<Key = M::Key, ValueIn = M::Value> + Send + Sync + 'static,
     {
         // Detect environment and build execution plan
-        let slurm = SlurmEnv::detect().unwrap_or({
-            let pid = std::process::id();
-            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let local_tasks = std::env::var("BJORN_LOCAL_TASKS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| num_cpus::get());
-            SlurmEnv { job_id: format!("local-{}-{}", pid, ts), ntasks: local_tasks.max(1), node_id: 0, node_list: "localhost".into() }
-        });
+        let slurm = detect_env_or_local();
         let output_dir = self.output.clone().context("output not set")?;
         let keep_intermediates = std::env::var("BJORN_KEEP_INTERMEDIATES")
             .ok()
@@ -303,17 +299,21 @@ fn get_fd_soft_limit() -> Option<u64> { None }
 // ============== Inner, env-agnostic phases ==============
 #[derive(Clone, Debug)]
 struct MapTaskStats {
+    #[allow(dead_code)]
     task_id: usize,
+    #[allow(dead_code)]
     num_files: u64,
     total_emits: u64,
     total_bytes_out: u64,
     total_flushes: u64,
+    #[allow(dead_code)]
     emit_time_ms: u64,
     wall_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 struct SortReducerWall {
+    #[allow(dead_code)]
     reducer: u64,
     lines_in: u64,
     bytes_in: u64,
@@ -326,6 +326,7 @@ struct SortReducerWall {
 
 #[derive(Clone, Debug)]
 struct ReduceStats {
+    #[allow(dead_code)]
     reducer: u64,
     lines_in: u64,
     groups: u64,
@@ -352,7 +353,7 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
         debug!(task_id, num_files = splits.len(), writers = num_reducers, "map task starting");
         // Stats
         let mut total_bytes_out: u64 = 0;
-        let mut total_flushes: u64 = 0; // number of write_chunk sends
+        let total_flushes: u64 = 0; // number of write_chunk sends (kept for compatibility)
         let mut total_emits: u64 = 0;
         let mut total_emit_time = Duration::from_nanos(0);
 

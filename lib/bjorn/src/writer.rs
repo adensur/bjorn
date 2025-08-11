@@ -197,7 +197,6 @@ impl PartitionCounters {
             total_write_ns: AtomicU64::new(0),
         }
     }
-    fn clone_ref(&self) -> PartitionCountersRef { PartitionCountersRef(self) }
 }
 
 #[derive(Clone, Copy)]

@@ -3,7 +3,6 @@ use bjorn::{Mapper, Reducer, RuntimePipeline};
 use bjorn::api::ExecutablePipeline;
 use clap::Parser;
 use regex::Regex;
-use std::iter;
 
 #[derive(Parser, Debug)]
 struct Args {

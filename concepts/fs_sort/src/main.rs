@@ -3,7 +3,7 @@ use clap::Parser;
 use memchr::memchr;
 use memmap2::Mmap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]

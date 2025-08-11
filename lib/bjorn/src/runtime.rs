@@ -323,23 +323,17 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
         let task_start = Instant::now();
         let splits = &chunks[task_id];
         debug!(task_id, num_files = splits.len(), writers = num_reducers, "map task starting");
-        // thread-local batching buffers per partition
-        const LOCAL_BATCH_BYTES: usize = 256 * 1024; // 256KB per partition chunk
+        // Stats
         let mut total_bytes_out: u64 = 0;
-        let mut total_flushes: u64 = 0;
+        let mut total_flushes: u64 = 0; // number of write_chunk sends
         let mut total_emits: u64 = 0;
         let mut total_emit_time = Duration::from_nanos(0);
-        let mut flush_part = |part: usize, pool: &WriterPool, buffers: &mut Vec<Vec<u8>>| {
-            if !buffers[part].is_empty() {
-                let chunk = std::mem::take(&mut buffers[part]);
-                total_bytes_out += chunk.len() as u64;
-                total_flushes += 1;
-                if let Err(e) = pool.write_chunk(part, chunk) { error!("writer_pool write_chunk failed: {}", e); }
-            }
-        };
 
         let text_format = TextLineFormat;
-        let mut process_one_file = |split: &Split, local_buffers: &mut Vec<Vec<u8>>| {
+        // Re-introduce small thread-local aggregation to reduce per-emit channel sends
+        let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
+        let mut tw = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
+        let mut process_one_file = |split: &Split| {
             let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
                 match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
             } else {
@@ -349,60 +343,51 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
             let mut emit = |k: M::Key, v: M::Value| {
                 let emit_start = Instant::now();
                 let part = hash_to_partition(&k, num_reducers);
-                let buf = &mut local_buffers[part];
-                // append a binary record
+                // build a binary record and buffer via ThreadWriter
                 let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
                 let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
                 let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
-                buf.extend_from_slice(&klen.to_le_bytes());
-                buf.extend_from_slice(&vlen.to_le_bytes());
-                buf.extend_from_slice(&key_bytes);
-                buf.extend_from_slice(&val_bytes);
-                if buf.len() >= LOCAL_BATCH_BYTES { flush_part(part, &writer_pool, local_buffers); }
+                let mut record = Vec::with_capacity(8 + key_bytes.len() + val_bytes.len());
+                record.extend_from_slice(&klen.to_le_bytes());
+                record.extend_from_slice(&vlen.to_le_bytes());
+                record.extend_from_slice(&key_bytes);
+                record.extend_from_slice(&val_bytes);
+                total_bytes_out += record.len() as u64;
+                tw.emit_record(part, &record);
                 total_emits += 1;
                 total_emit_time += emit_start.elapsed();
             };
             mapper.do_map(lines_iter, &mut emit);
+            tw.flush_all();
         };
 
         if parallelize_splits {
             splits.par_iter().for_each(|split| {
-                let mut thread_local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
-                // Process split with a local emit that uses local buffers
                 let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
                     match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
                 } else {
                     match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
                 };
                 let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
+                let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
+                let mut tw = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
                 let mut emit = |k: M::Key, v: M::Value| {
                     let part = hash_to_partition(&k, num_reducers);
-                    let buf = &mut thread_local_buffers[part];
                     let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
                     let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
                     let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
-                    buf.extend_from_slice(&klen.to_le_bytes());
-                    buf.extend_from_slice(&vlen.to_le_bytes());
-                    buf.extend_from_slice(&key_bytes);
-                    buf.extend_from_slice(&val_bytes);
-                    if buf.len() >= LOCAL_BATCH_BYTES {
-                        let chunk = std::mem::take(buf);
-                        if let Err(e) = writer_pool.write_chunk(part, chunk) { error!("writer_pool write_chunk failed: {}", e); }
-                    }
+                    let mut record = Vec::with_capacity(8 + key_bytes.len() + val_bytes.len());
+                    record.extend_from_slice(&klen.to_le_bytes());
+                    record.extend_from_slice(&vlen.to_le_bytes());
+                    record.extend_from_slice(&key_bytes);
+                    record.extend_from_slice(&val_bytes);
+                    tw.emit_record(part, &record);
                 };
                 mapper.do_map(lines_iter, &mut emit);
-                // flush per-thread buffers
-                for part in 0..num_reducers {
-                    if !thread_local_buffers[part].is_empty() {
-                        let chunk = std::mem::take(&mut thread_local_buffers[part]);
-                        if let Err(e) = writer_pool.write_chunk(part, chunk) { error!("writer_pool write_chunk failed: {}", e); }
-                    }
-                }
+                tw.flush_all();
             });
         } else {
-            let mut local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
-            for split in splits { process_one_file(split, &mut local_buffers); }
-            for part in 0..num_reducers { flush_part(part, &writer_pool, &mut local_buffers); }
+            for split in splits { process_one_file(split); }
         }
 
         // touch barrier file

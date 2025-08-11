@@ -87,4 +87,52 @@ impl WriterPool {
             let _ = tx.send(WriterMsg::Close);
         }
     }
+
+    pub fn make_thread_writer(&self, num_partitions: usize, local_batch_bytes: usize) -> ThreadWriter {
+        ThreadWriter::new(self, num_partitions, local_batch_bytes)
+    }
+}
+
+pub struct ThreadWriter<'a> {
+    pool: &'a WriterPool,
+    local_buffers: Vec<Vec<u8>>, // per-partition aggregation buffers
+    batch_bytes: usize,
+    flushes: u64,
+    bytes_sent: u64,
+}
+
+impl<'a> ThreadWriter<'a> {
+    fn new(pool: &'a WriterPool, num_partitions: usize, batch_bytes: usize) -> Self {
+        let local_buffers = (0..num_partitions).map(|_| Vec::with_capacity(batch_bytes)).collect();
+        Self { pool, local_buffers, batch_bytes, flushes: 0, bytes_sent: 0 }
+    }
+
+    pub fn emit_record(&mut self, partition: usize, record: &[u8]) {
+        let buf = &mut self.local_buffers[partition];
+        buf.extend_from_slice(record);
+        if buf.len() >= self.batch_bytes {
+            self.flush_partition(partition);
+        }
+    }
+
+    pub fn flush_all(&mut self) {
+        for p in 0..self.local_buffers.len() {
+            if !self.local_buffers[p].is_empty() {
+                self.flush_partition(p);
+            }
+        }
+    }
+
+    fn flush_partition(&mut self, partition: usize) {
+        let chunk = std::mem::take(&mut self.local_buffers[partition]);
+        self.bytes_sent += chunk.len() as u64;
+        self.flushes += 1;
+        if let Err(e) = self.pool.write_chunk(partition, chunk) {
+            error!("writer_pool write_chunk failed: {}", e);
+        }
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        (self.flushes, self.bytes_sent)
+    }
 }

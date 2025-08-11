@@ -1,14 +1,15 @@
 use crate::api::{ExecutablePipeline, Mapper, Reducer};
-use crate::io::{ensure_dir, hash_to_partition, list_files_recursive, open_reader, open_writer, write_bin, read_bin_line, write_tsv,
+use crate::io::{ensure_dir, hash_to_partition, open_writer, read_bin_line,
     LocalFsSource, TextLineFormat, S3Source, Split, Source, Format};
+use crate::sort::external_sort_by_key;
+use crate::stats::StatsCollector;
 use crate::slurm::SlurmEnv;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use memmap2::Mmap;
-use memchr::memchr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, debug};
 use crossbeam_channel as channel;
@@ -16,39 +17,7 @@ use serde::Serialize;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug)]
-struct MapTaskStats {
-    task_id: usize,
-    num_files: u64,
-    total_emits: u64,
-    total_bytes_out: u64,
-    total_flushes: u64,
-    emit_time_ms: u64,
-    wall_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-struct SortStats {
-    reducer: u64,
-    input_files: u64,
-    lines_in: u64,
-    bytes_in: u64,
-    sort_ms: u64,
-    io_read_ms: u64,
-    io_write_ms: u64,
-    wall_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-struct ReduceStats {
-    reducer: u64,
-    lines_in: u64,
-    groups: u64,
-    parse_ms: u64,
-    reduce_ms: u64,
-    write_ms: u64,
-    wall_ms: u64,
-}
+// moved to inner section below
 
 pub struct RuntimePipeline {
     inputs: Vec<String>,
@@ -74,6 +43,7 @@ impl ExecutablePipeline for RuntimePipeline {
         M: Mapper<Input = String> + Send + Sync + 'static,
         R: Reducer<Key = M::Key, ValueIn = M::Value> + Send + Sync + 'static,
     {
+        // Detect environment and build execution plan
         let slurm = SlurmEnv::detect().unwrap_or({
             let pid = std::process::id();
             let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -132,7 +102,7 @@ impl ExecutablePipeline for RuntimePipeline {
             }
         }
 
-        // Determine task topology
+        // Determine task topology and plan what this process should do
         let is_slurm = SlurmEnv::is_slurm();
         let local_subtasks = if is_slurm {
             std::env::var("BJORN_LOCAL_SUBTASKS").ok().and_then(|v| v.parse::<usize>().ok())
@@ -173,126 +143,17 @@ impl ExecutablePipeline for RuntimePipeline {
         let (pool_inner, pool_joiner) = WriterPool::new(map_out_dir.clone(), slurm.node_id, num_reducers, flush_bytes, Duration::from_millis(flush_interval_ms))?;
         let writer_pool = Arc::new(pool_inner);
         let mut writer_joiner = pool_joiner;
-
-        // Map phase
-        let map_stats: Arc<Mutex<Vec<MapTaskStats>>> = Arc::new(Mutex::new(Vec::new()));
+        // ========== Map phase (inner, env-agnostic) ==========
+        let mut stats = StatsCollector::new();
+        let parallelize_splits = is_slurm; // hint: under Slurm, parallelize across files inside a task
         let map_phase_start = Instant::now();
-        let run_map_for = |task_id: usize| {
-            let task_start = Instant::now();
-            let splits = &chunks[task_id];
-            debug!(task_id, num_files = splits.len(), writers = num_reducers, "map task starting");
-            // thread-local batching buffers per partition
-            let mut local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
-            const LOCAL_BATCH_BYTES: usize = 256 * 1024; // 256KB per partition chunk
-            let mut total_bytes_out: u64 = 0;
-            let mut total_flushes: u64 = 0;
-            let mut total_emits: u64 = 0;
-            let mut total_emit_time = Duration::from_nanos(0);
-            let mut flush_part = |part: usize, pool: &WriterPool, buffers: &mut Vec<Vec<u8>>| {
-                if !buffers[part].is_empty() {
-                    let chunk = std::mem::take(&mut buffers[part]);
-                    total_bytes_out += chunk.len() as u64;
-                    total_flushes += 1;
-                    if let Err(e) = pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
-                }
-            };
-
-            let text_format = TextLineFormat;
-            let mut process_one_file = |split: &Split, local_buffers: &mut Vec<Vec<u8>>| {
-                let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
-                    match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-                } else {
-                    match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-                };
-                let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
-                let mut emit = |k: M::Key, v: M::Value| {
-                    let emit_start = Instant::now();
-                    let part = hash_to_partition(&k, num_reducers);
-                    let buf = &mut local_buffers[part];
-                    // append a binary record
-                    let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
-                    let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
-                    let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
-                    buf.extend_from_slice(&klen.to_le_bytes());
-                    buf.extend_from_slice(&vlen.to_le_bytes());
-                    buf.extend_from_slice(&key_bytes);
-                    buf.extend_from_slice(&val_bytes);
-                    if buf.len() >= LOCAL_BATCH_BYTES { flush_part(part, &writer_pool, local_buffers); }
-                    total_emits += 1;
-                    total_emit_time += emit_start.elapsed();
-                };
-                let _do_map_start = Instant::now();
-                mapper.do_map(lines_iter, &mut emit);
-            };
-
-            if is_slurm {
-                // Parallelize within this task across files when under Slurm (use available cpus-per-task)
-                splits.par_iter().for_each(|split| {
-                    let mut thread_local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
-                    // Process split with a local emit that uses local buffers
-                    let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
-                        match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-                    } else {
-                        match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-                    };
-                    let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
-                    let mut emit = |k: M::Key, v: M::Value| {
-                        let part = hash_to_partition(&k, num_reducers);
-                        let buf = &mut thread_local_buffers[part];
-                        let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
-                        let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
-                        let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
-                        buf.extend_from_slice(&klen.to_le_bytes());
-                        buf.extend_from_slice(&vlen.to_le_bytes());
-                        buf.extend_from_slice(&key_bytes);
-                        buf.extend_from_slice(&val_bytes);
-                        if buf.len() >= LOCAL_BATCH_BYTES {
-                            let chunk = std::mem::take(buf);
-                            if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
-                        }
-                    };
-                    mapper.do_map(lines_iter, &mut emit);
-                    // flush per-thread buffers
-                    for part in 0..num_reducers {
-                        if !thread_local_buffers[part].is_empty() {
-                            let chunk = std::mem::take(&mut thread_local_buffers[part]);
-                            if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
-                        }
-                    }
-                });
-            } else {
-                for split in splits { process_one_file(split, &mut local_buffers); }
-            }
-            // flush remaining buffers
-            for part in 0..num_reducers { flush_part(part, &writer_pool, &mut local_buffers); }
-            // touch barrier file
-            let barrier_path = format!("{}/barrier_map_done_{}", launch_root, task_id);
-            if let Err(e) = fs::write(&barrier_path, b"ok") { error!("barrier write: {}", e); }
-
-            // record stats
-            let mut guard = map_stats.lock().unwrap();
-            guard.push(MapTaskStats {
-                task_id,
-                num_files: splits.len() as u64,
-                total_emits,
-                total_bytes_out,
-                total_flushes,
-                emit_time_ms: total_emit_time.as_millis() as u64,
-                wall_ms: task_start.elapsed().as_millis() as u64,
-            });
-        };
-
-        if is_slurm {
-            // Run this process's logical subtasks: ids are node_id + k * slurm.ntasks
-            let my_task_ids: Vec<usize> = (0..local_subtasks)
+        let my_task_ids: Vec<usize> = if is_slurm {
+            (0..local_subtasks)
                 .map(|k| slurm.node_id + k * slurm.ntasks)
                 .filter(|&id| id < global_ntasks)
-                .collect();
-            my_task_ids.into_par_iter().for_each(|task_id| run_map_for(task_id));
-        } else {
-            // local: still run tasks in parallel
-            (0..global_ntasks).into_par_iter().for_each(|task_id| run_map_for(task_id));
-        }
+                .collect()
+        } else { (0..global_ntasks).collect() };
+        let map_stats_vec = run_map_phase(mapper.clone(), &my_task_ids, &chunks, num_reducers, writer_pool.clone(), &launch_root, parallelize_splits);
 
         // wait for all tasks to finish map when under slurm
         if is_slurm {
@@ -306,202 +167,59 @@ impl ExecutablePipeline for RuntimePipeline {
         writer_joiner.join_all();
 
         let map_phase_ms = map_phase_start.elapsed().as_millis() as u64;
-        // emit per-task stats and aggregate
-        let map_stats_vec = map_stats.lock().unwrap().clone();
+        // aggregate via StatsCollector
         if !map_stats_vec.is_empty() {
-            let total_emits: u64 = map_stats_vec.iter().map(|s| s.total_emits).sum();
-            let total_bytes_out: u64 = map_stats_vec.iter().map(|s| s.total_bytes_out).sum();
-            let total_flushes: u64 = map_stats_vec.iter().map(|s| s.total_flushes).sum();
-            let min_wall = map_stats_vec.iter().map(|s| s.wall_ms).min().unwrap_or(0);
-            let max_wall = map_stats_vec.iter().map(|s| s.wall_ms).max().unwrap_or(0);
-            info!(phase = "map",
-                  tasks = map_stats_vec.len(),
-                  total_emits, total_bytes_out, total_flushes,
-                  min_task_ms = min_wall, max_task_ms = max_wall,
-                  wall_ms = map_phase_ms,
-                  "Map phase complete");
+            let per_task: Vec<(u64, u64, u64, u64)> = map_stats_vec
+                .iter()
+                .map(|s| (s.total_emits, s.total_bytes_out, s.total_flushes, s.wall_ms))
+                .collect();
+            stats.record_map(&per_task, map_phase_ms);
+            // log
+            if let Some(ms) = &stats.map {
+                info!(phase = "map",
+                      tasks = ms.tasks,
+                      total_emits = ms.total_emits,
+                      total_bytes_out = ms.total_bytes_out,
+                      total_flushes = ms.total_flushes,
+                      min_task_ms = ms.min_task_ms,
+                      max_task_ms = ms.max_task_ms,
+                      wall_ms = ms.wall_ms,
+                      "Map phase complete");
+            }
         }
 
-        // Sort/shuffle
-        let sort_stats: Arc<Mutex<Vec<SortStats>>> = Arc::new(Mutex::new(Vec::new()));
+        // ========== Sort/shuffle (inner, env-agnostic) ==========
         let sort_phase_start = Instant::now();
-        let run_sort_for = |r: usize| {
-            let reducer_start = Instant::now();
-            let pattern = format!("{}/task*_part{}.tsv", map_out_dir, r);
-            let mut paths = match glob::glob(&pattern) { Ok(g) => g.flatten().collect::<Vec<_>>(), Err(e) => { error!("glob error: {}", e); Vec::new() } };
-            paths.sort();
-
-            // Mmap each input file and build record index: (file_idx, start, key_end, end)
-            let mut file_maps: Vec<Mmap> = Vec::new();
-            let mut all_lines: Vec<(usize, usize, usize, usize)> = Vec::new();
-            let mut bytes_in: u64 = 0;
-            let mut lines_in: u64 = 0;
-            let mut io_read = Duration::from_nanos(0);
-
-            for p in &paths {
-                match std::fs::File::open(&p) {
-                    Ok(file) => {
-                        let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                        bytes_in += meta_len as u64;
-                        let read_start = Instant::now();
-                        match unsafe { Mmap::map(&file) } {
-                            Ok(map) => {
-                                let file_idx = file_maps.len();
-                                let bytes = &map[..];
-                                let mut off = 0usize;
-                                while let Some((k, v, next)) = read_bin_line(bytes, off) {
-                                    let key_start = off + 8; // after 2 u32 lengths
-                                    let key_end = key_start + k.len();
-                                    let end = next;
-                                    all_lines.push((file_idx, key_start - 8, key_end, end));
-                                    lines_in += 1;
-                                    off = next;
-                                }
-                                file_maps.push(map);
-                            }
-                            Err(e) => error!("mmap {}: {}", p.display(), e),
-                        }
-                        io_read += read_start.elapsed();
-                    }
-                    Err(e) => { error!("open {}: {}", p.display(), e); }
-                }
-            }
-
-            let sort_only_start = Instant::now();
-            all_lines.par_sort_by(|a, b| {
-                let (fia, sa, ka, _ea) = *a;
-                let (fib, sb, kb, _eb) = *b;
-                // Keys are at [sa+8..ka] because [sa..sa+8) holds the lengths
-                file_maps[fia][(sa+8)..ka].cmp(&file_maps[fib][(sb+8)..kb])
-            });
-            let sort_only_ms = sort_only_start.elapsed().as_millis() as u64;
-
-            let out_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
-            let io_write_start = Instant::now();
-            match std::fs::File::create(&out_path) {
-                Ok(file) => {
-                    let mut w = std::io::BufWriter::with_capacity(32 * 1024 * 1024, file);
-                    for &(fi, s, _k, e) in &all_lines {
-                        if let Err(e2) = w.write_all(&file_maps[fi][s..e]) { error!("write reduce_in {}: {}", out_path, e2); break; }
-                    }
-                    if let Err(e) = w.flush() { error!("flush reduce_in {}: {}", out_path, e); }
-                }
-                Err(e) => error!("create reduce_in {}: {}", out_path, e),
-            }
-            let io_write_ms = io_write_start.elapsed().as_millis() as u64;
-            // barrier for sort
-            let barrier_path = format!("{}/barrier_sort_done_{}", launch_root, r);
-            if let Err(e) = fs::write(&barrier_path, b"ok") { error!("barrier write: {}", e); }
-
-            // record stats
-            let mut guard = sort_stats.lock().unwrap();
-            guard.push(SortStats {
-                reducer: r as u64,
-                input_files: paths.len() as u64,
-                lines_in,
-                bytes_in,
-                sort_ms: sort_only_ms,
-                io_read_ms: io_read.as_millis() as u64,
-                io_write_ms,
-                wall_ms: reducer_start.elapsed().as_millis() as u64,
-            });
-        };
-
+        let my_reducers: Vec<usize> = if is_slurm { vec![slurm.node_id] } else { (0..num_reducers).collect() };
+        let sort_stats_vec = run_sort_phase(&my_reducers, &map_out_dir, &sort_out_dir, &launch_root);
         if is_slurm {
-            run_sort_for(slurm.node_id);
             // wait for all reducers' sort
             let t0 = Instant::now();
             wait_for_barrier(&launch_root, "sort_done", num_reducers);
             info!(phase = "barrier_sort_wait", wait_ms = t0.elapsed().as_millis() as u64, "Barrier wait for sort phase completed");
-        } else {
-            (0..num_reducers).into_par_iter().for_each(|r| run_sort_for(r));
         }
         let sort_phase_ms = sort_phase_start.elapsed().as_millis() as u64;
-        let sort_stats_vec = sort_stats.lock().unwrap().clone();
         if !sort_stats_vec.is_empty() {
             let total_lines: u64 = sort_stats_vec.iter().map(|s| s.lines_in).sum();
             let total_bytes: u64 = sort_stats_vec.iter().map(|s| s.bytes_in).sum();
             let min_wall = sort_stats_vec.iter().map(|s| s.wall_ms).min().unwrap_or(0);
             let max_wall = sort_stats_vec.iter().map(|s| s.wall_ms).max().unwrap_or(0);
-            info!(phase = "sort",
-                  reducers = sort_stats_vec.len(), total_lines, total_bytes,
-                  min_reducer_ms = min_wall, max_reducer_ms = max_wall,
-                  wall_ms = sort_phase_ms,
-                  "Sort phase complete");
+            stats.record_sort(sort_stats_vec.len(), total_lines, total_bytes, min_wall, max_wall, sort_phase_ms);
+            if let Some(ss) = &stats.sort {
+                info!(phase = "sort",
+                      reducers = ss.reducers, total_lines = ss.total_lines, total_bytes = ss.total_bytes,
+                      min_reducer_ms = ss.min_reducer_ms, max_reducer_ms = ss.max_reducer_ms,
+                      wall_ms = ss.wall_ms,
+                      "Sort phase complete");
+            }
         }
 
-        // Reduce phase
-        let reducer = Arc::new(reducer);
-        let reduce_stats: Arc<Mutex<Vec<ReduceStats>>> = Arc::new(Mutex::new(Vec::new()));
+        // ========== Reduce phase (inner, env-agnostic) ==========
         let reduce_phase_start = Instant::now();
-        let run_reduce_for = |r: usize| {
-            let reducer_start = Instant::now();
-            let in_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
-            let file = match std::fs::File::open(&in_path) { Ok(f) => f, Err(e) => { error!("open {}: {}", in_path, e); return; } };
-            let map = match unsafe { Mmap::map(&file) } { Ok(m) => m, Err(e) => { error!("mmap {}: {}", in_path, e); return; } };
-            let bytes = &map[..];
-
-            let mut current_key: Option<R::Key> = None;
-            let mut buffer: Vec<R::ValueIn> = Vec::new();
-
-            let mut out_writer = match open_writer(format!("{}/part-{:05}.tsv", output_dir, r)) { Ok(w) => w, Err(e) => { error!("open_writer output: {}", e); return; } };
-
-            let mut parse_time = Duration::from_nanos(0);
-            let mut reduce_time = Duration::from_nanos(0);
-            let mut write_time = Duration::from_nanos(0);
-            let mut groups: u64 = 0;
-
-            let mut flush_group = |key: &R::Key, vals: &Vec<R::ValueIn>, reducer: &R, out_writer: &mut std::io::BufWriter<std::fs::File>| {
-                let reduce_start = Instant::now();
-                let mut emit = |line: String| {
-                    let w_start = Instant::now();
-                    if let Err(e) = writeln!(out_writer, "{}", line) { error!("write reduce tsv line: {}", e); }
-                    write_time += w_start.elapsed();
-                };
-                reducer.do_reduce(key, vals.clone().into_iter(), &mut emit);
-                reduce_time += reduce_start.elapsed();
-                groups += 1;
-            };
-
-            let mut lines_in: u64 = 0;
-            let mut off = 0usize;
-            while let Some((k, v, next)) = read_bin_line(bytes, off) {
-                let p_start = Instant::now();
-                let k_typed: R::Key = match bincode::deserialize(k) { Ok(v) => v, Err(e) => { error!("bad key bin: {}", e); break; } };
-                let v_typed: R::ValueIn = match bincode::deserialize(v) { Ok(v) => v, Err(e) => { error!("bad val bin: {}", e); break; } };
-                parse_time += p_start.elapsed();
-                lines_in += 1;
-                match &current_key {
-                    None => { current_key = Some(k_typed); buffer.clear(); buffer.push(v_typed); }
-                    Some(cur) if cur == &k_typed => { buffer.push(v_typed); }
-                    Some(cur) => {
-                        flush_group(cur, &buffer, &reducer, &mut out_writer);
-                        current_key = Some(k_typed);
-                        buffer.clear();
-                        buffer.push(v_typed);
-                    }
-                }
-                off = next;
-            }
-            if let Some(cur) = current_key.take() { flush_group(&cur, &buffer, &reducer, &mut out_writer); }
-            // record stats
-            let mut guard = reduce_stats.lock().unwrap();
-            guard.push(ReduceStats {
-                reducer: r as u64,
-                lines_in,
-                groups,
-                parse_ms: parse_time.as_millis() as u64,
-                reduce_ms: reduce_time.as_millis() as u64,
-                write_ms: write_time.as_millis() as u64,
-                wall_ms: reducer_start.elapsed().as_millis() as u64,
-            });
-        };
-
+        let my_reducers: Vec<usize> = if is_slurm { vec![slurm.node_id] } else { (0..num_reducers).collect() };
+        let reduce_done_label = if is_slurm { Some(slurm.node_id) } else { None };
+        let reduce_stats_vec = run_reduce_phase(Arc::new(reducer), &my_reducers, &sort_out_dir, &output_dir, &launch_root, reduce_done_label);
         if is_slurm {
-            run_reduce_for(slurm.node_id);
-            // mark reduce done for this node
-            let barrier_path = format!("{}/barrier_reduce_done_{}", launch_root, slurm.node_id);
-            let _ = fs::write(&barrier_path, b"ok");
             // only rank0 performs cleanup after all are done
             if slurm.node_id == 0 {
                 let t0 = Instant::now();
@@ -510,23 +228,24 @@ impl ExecutablePipeline for RuntimePipeline {
                 if !keep_intermediates { let _ = fs::remove_dir_all(&launch_root); }
             }
         } else {
-            (0..num_reducers).into_par_iter().for_each(|r| run_reduce_for(r));
             // local cleanup of intermediates
             if !keep_intermediates { let _ = fs::remove_dir_all(&launch_root); }
         }
 
         let reduce_phase_ms = reduce_phase_start.elapsed().as_millis() as u64;
-        let reduce_stats_vec = reduce_stats.lock().unwrap().clone();
         if !reduce_stats_vec.is_empty() {
             let total_lines: u64 = reduce_stats_vec.iter().map(|s| s.lines_in).sum();
             let total_groups: u64 = reduce_stats_vec.iter().map(|s| s.groups).sum();
             let min_wall = reduce_stats_vec.iter().map(|s| s.wall_ms).min().unwrap_or(0);
             let max_wall = reduce_stats_vec.iter().map(|s| s.wall_ms).max().unwrap_or(0);
-            info!(phase = "reduce",
-                  reducers = reduce_stats_vec.len(), total_lines, total_groups,
-                  min_reducer_ms = min_wall, max_reducer_ms = max_wall,
-                  wall_ms = reduce_phase_ms,
-                  "Reduce phase complete");
+            stats.record_reduce(reduce_stats_vec.len(), total_lines, total_groups, min_wall, max_wall, reduce_phase_ms);
+            if let Some(rs) = &stats.reduce {
+                info!(phase = "reduce",
+                      reducers = rs.reducers, total_lines = rs.total_lines, total_groups = rs.total_groups,
+                      min_reducer_ms = rs.min_reducer_ms, max_reducer_ms = rs.max_reducer_ms,
+                      wall_ms = rs.wall_ms,
+                      "Reduce phase complete");
+            }
         }
 
         Ok(())
@@ -567,6 +286,256 @@ fn get_fd_soft_limit() -> Option<u64> { None }
 // ============== Writer Pool ==============
 struct WriterPool {
     senders: Vec<channel::Sender<WriterMsg>>,
+}
+
+// ============== Inner, env-agnostic phases ==============
+#[derive(Clone, Debug)]
+struct MapTaskStats {
+    task_id: usize,
+    num_files: u64,
+    total_emits: u64,
+    total_bytes_out: u64,
+    total_flushes: u64,
+    emit_time_ms: u64,
+    wall_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SortReducerWall { reducer: u64, lines_in: u64, bytes_in: u64, wall_ms: u64 }
+
+#[derive(Clone, Debug)]
+struct ReduceStats {
+    reducer: u64,
+    lines_in: u64,
+    groups: u64,
+    parse_ms: u64,
+    reduce_ms: u64,
+    write_ms: u64,
+    wall_ms: u64,
+}
+
+fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
+    mapper: Arc<M>,
+    my_task_ids: &[usize],
+    chunks: &Vec<Vec<Split>>,
+    num_reducers: usize,
+    writer_pool: Arc<WriterPool>,
+    launch_root: &str,
+    parallelize_splits: bool,
+) -> Vec<MapTaskStats> {
+    let map_stats: Arc<Mutex<Vec<MapTaskStats>>> = Arc::new(Mutex::new(Vec::new()));
+    let run_map_for = |task_id: usize| {
+        let task_start = Instant::now();
+        let splits = &chunks[task_id];
+        debug!(task_id, num_files = splits.len(), writers = num_reducers, "map task starting");
+        // thread-local batching buffers per partition
+        const LOCAL_BATCH_BYTES: usize = 256 * 1024; // 256KB per partition chunk
+        let mut total_bytes_out: u64 = 0;
+        let mut total_flushes: u64 = 0;
+        let mut total_emits: u64 = 0;
+        let mut total_emit_time = Duration::from_nanos(0);
+        let mut flush_part = |part: usize, pool: &WriterPool, buffers: &mut Vec<Vec<u8>>| {
+            if !buffers[part].is_empty() {
+                let chunk = std::mem::take(&mut buffers[part]);
+                total_bytes_out += chunk.len() as u64;
+                total_flushes += 1;
+                if let Err(e) = pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
+            }
+        };
+
+        let text_format = TextLineFormat;
+        let mut process_one_file = |split: &Split, local_buffers: &mut Vec<Vec<u8>>| {
+            let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
+                match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+            } else {
+                match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+            };
+            let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
+            let mut emit = |k: M::Key, v: M::Value| {
+                let emit_start = Instant::now();
+                let part = hash_to_partition(&k, num_reducers);
+                let buf = &mut local_buffers[part];
+                // append a binary record
+                let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
+                let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
+                let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
+                buf.extend_from_slice(&klen.to_le_bytes());
+                buf.extend_from_slice(&vlen.to_le_bytes());
+                buf.extend_from_slice(&key_bytes);
+                buf.extend_from_slice(&val_bytes);
+                if buf.len() >= LOCAL_BATCH_BYTES { flush_part(part, &writer_pool, local_buffers); }
+                total_emits += 1;
+                total_emit_time += emit_start.elapsed();
+            };
+            mapper.do_map(lines_iter, &mut emit);
+        };
+
+        if parallelize_splits {
+            splits.par_iter().for_each(|split| {
+                let mut thread_local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
+                // Process split with a local emit that uses local buffers
+                let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
+                    match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+                } else {
+                    match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
+                };
+                let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
+                let mut emit = |k: M::Key, v: M::Value| {
+                    let part = hash_to_partition(&k, num_reducers);
+                    let buf = &mut thread_local_buffers[part];
+                    let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
+                    let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
+                    let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
+                    buf.extend_from_slice(&klen.to_le_bytes());
+                    buf.extend_from_slice(&vlen.to_le_bytes());
+                    buf.extend_from_slice(&key_bytes);
+                    buf.extend_from_slice(&val_bytes);
+                    if buf.len() >= LOCAL_BATCH_BYTES {
+                        let chunk = std::mem::take(buf);
+                        if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
+                    }
+                };
+                mapper.do_map(lines_iter, &mut emit);
+                // flush per-thread buffers
+                for part in 0..num_reducers {
+                    if !thread_local_buffers[part].is_empty() {
+                        let chunk = std::mem::take(&mut thread_local_buffers[part]);
+                        if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
+                    }
+                }
+            });
+        } else {
+            let mut local_buffers: Vec<Vec<u8>> = (0..num_reducers).map(|_| Vec::with_capacity(256 * 1024)).collect();
+            for split in splits { process_one_file(split, &mut local_buffers); }
+            for part in 0..num_reducers { flush_part(part, &writer_pool, &mut local_buffers); }
+        }
+
+        // touch barrier file
+        let barrier_path = format!("{}/barrier_map_done_{}", launch_root, task_id);
+        if let Err(e) = fs::write(&barrier_path, b"ok") { error!("barrier write: {}", e); }
+
+        // record stats
+        let mut guard = map_stats.lock().unwrap();
+        guard.push(MapTaskStats {
+            task_id,
+            num_files: splits.len() as u64,
+            total_emits,
+            total_bytes_out,
+            total_flushes,
+            emit_time_ms: total_emit_time.as_millis() as u64,
+            wall_ms: task_start.elapsed().as_millis() as u64,
+        });
+    };
+
+    my_task_ids.into_par_iter().for_each(|task_id| run_map_for(*task_id));
+    let out = map_stats.lock().unwrap().clone();
+    out
+}
+
+fn run_sort_phase(my_reducers: &[usize], map_out_dir: &str, sort_out_dir: &str, launch_root: &str) -> Vec<SortReducerWall> {
+    let sort_stats: Arc<Mutex<Vec<SortReducerWall>>> = Arc::new(Mutex::new(Vec::new()));
+    let run_sort_for = |r: usize| {
+        let reducer_start = Instant::now();
+        let pattern = format!("{}/task*_part{}.tsv", map_out_dir, r);
+        let mut paths = match glob::glob(&pattern) { Ok(g) => g.flatten().collect::<Vec<_>>(), Err(e) => { error!("glob error: {}", e); Vec::new() } };
+        paths.sort();
+        let input_paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let out_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
+        match external_sort_by_key(&input_paths, &out_path) {
+            Ok(outcome) => {
+                // barrier for sort
+                let barrier_path = format!("{}/barrier_sort_done_{}", launch_root, r);
+                let _ = fs::write(&barrier_path, b"ok");
+                let mut guard = sort_stats.lock().unwrap();
+                guard.push(SortReducerWall { reducer: r as u64, lines_in: outcome.lines_in, bytes_in: outcome.bytes_in, wall_ms: reducer_start.elapsed().as_millis() as u64 });
+            }
+            Err(e) => error!("external_sort_by_key failed for reducer {}: {}", r, e),
+        }
+    };
+    my_reducers.into_par_iter().for_each(|r| run_sort_for(*r));
+    let out = sort_stats.lock().unwrap().clone();
+    out
+}
+
+fn run_reduce_phase<R: Reducer + Send + Sync + 'static>(
+    reducer: Arc<R>,
+    my_reducers: &[usize],
+    sort_out_dir: &str,
+    output_dir: &str,
+    launch_root: &str,
+    mark_done_index: Option<usize>,
+) -> Vec<ReduceStats> {
+    let reduce_stats: Arc<Mutex<Vec<ReduceStats>>> = Arc::new(Mutex::new(Vec::new()));
+    let run_reduce_for = |r: usize| {
+        let reducer_start = Instant::now();
+        let in_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
+        let file = match std::fs::File::open(&in_path) { Ok(f) => f, Err(e) => { error!("open {}: {}", in_path, e); return; } };
+        let map = match unsafe { Mmap::map(&file) } { Ok(m) => m, Err(e) => { error!("mmap {}: {}", in_path, e); return; } };
+        let bytes = &map[..];
+
+        let mut current_key: Option<R::Key> = None;
+        let mut buffer: Vec<R::ValueIn> = Vec::new();
+
+        let mut out_writer = match open_writer(format!("{}/part-{:05}.tsv", output_dir, r)) { Ok(w) => w, Err(e) => { error!("open_writer output: {}", e); return; } };
+
+        let mut parse_time = Duration::from_nanos(0);
+        let mut reduce_time = Duration::from_nanos(0);
+        let mut write_time = Duration::from_nanos(0);
+        let mut groups: u64 = 0;
+
+        let mut flush_group = |key: &R::Key, vals: &Vec<R::ValueIn>, reducer: &R, out_writer: &mut std::io::BufWriter<std::fs::File>| {
+            let reduce_start = Instant::now();
+            let mut emit = |line: String| {
+                let w_start = Instant::now();
+                let _ = writeln!(out_writer, "{}", line);
+                write_time += w_start.elapsed();
+            };
+            reducer.do_reduce(key, vals.clone().into_iter(), &mut emit);
+            reduce_time += reduce_start.elapsed();
+            groups += 1;
+        };
+
+        let mut lines_in: u64 = 0;
+        let mut off = 0usize;
+        while let Some((k, v, next)) = read_bin_line(bytes, off) {
+            let p_start = Instant::now();
+            let k_typed: R::Key = match bincode::deserialize(k) { Ok(v) => v, Err(_e) => { break; } };
+            let v_typed: R::ValueIn = match bincode::deserialize(v) { Ok(v) => v, Err(_e) => { break; } };
+            parse_time += p_start.elapsed();
+            lines_in += 1;
+            match &current_key {
+                None => { current_key = Some(k_typed); buffer.clear(); buffer.push(v_typed); }
+                Some(cur) if cur == &k_typed => { buffer.push(v_typed); }
+                Some(cur) => {
+                    flush_group(cur, &buffer, &reducer, &mut out_writer);
+                    current_key = Some(k_typed);
+                    buffer.clear();
+                    buffer.push(v_typed);
+                }
+            }
+            off = next;
+        }
+        if let Some(cur) = current_key.take() { flush_group(&cur, &buffer, &reducer, &mut out_writer); }
+        // record stats
+        let mut guard = reduce_stats.lock().unwrap();
+        guard.push(ReduceStats {
+            reducer: r as u64,
+            lines_in,
+            groups,
+            parse_ms: parse_time.as_millis() as u64,
+            reduce_ms: reduce_time.as_millis() as u64,
+            write_ms: write_time.as_millis() as u64,
+            wall_ms: reducer_start.elapsed().as_millis() as u64,
+        });
+    };
+
+    my_reducers.into_par_iter().for_each(|r| run_reduce_for(*r));
+    if let Some(idx) = mark_done_index {
+        let barrier_path = format!("{}/barrier_reduce_done_{}", launch_root, idx);
+        let _ = fs::write(&barrier_path, b"ok");
+    }
+    let out = reduce_stats.lock().unwrap().clone();
+    out
 }
 
 enum WriterMsg {

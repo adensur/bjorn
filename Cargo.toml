@@ -3,6 +3,7 @@ members = [
   "lib/bjorn",
   "examples/wordcount",
   "naive_examples/wordcount",
+  "concepts/fs_sort",
 ]
 resolver = "2"
 

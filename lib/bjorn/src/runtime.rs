@@ -12,9 +12,7 @@ use memmap2::Mmap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, debug};
-use crossbeam_channel as channel;
-use serde::Serialize;
-use std::thread;
+use crate::writer::{WriterPool, WriterJoiner};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // moved to inner section below
@@ -283,10 +281,7 @@ fn get_fd_soft_limit() -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn get_fd_soft_limit() -> Option<u64> { None }
 
-// ============== Writer Pool ==============
-struct WriterPool {
-    senders: Vec<channel::Sender<WriterMsg>>,
-}
+// WriterPool moved to writer.rs
 
 // ============== Inner, env-agnostic phases ==============
 #[derive(Clone, Debug)]
@@ -339,7 +334,7 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
                 let chunk = std::mem::take(&mut buffers[part]);
                 total_bytes_out += chunk.len() as u64;
                 total_flushes += 1;
-                if let Err(e) = pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
+                if let Err(e) = pool.write_chunk(part, chunk) { error!("writer_pool write_chunk failed: {}", e); }
             }
         };
 
@@ -392,7 +387,7 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
                     buf.extend_from_slice(&val_bytes);
                     if buf.len() >= LOCAL_BATCH_BYTES {
                         let chunk = std::mem::take(buf);
-                        if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
+                        if let Err(e) = writer_pool.write_chunk(part, chunk) { error!("writer_pool write_chunk failed: {}", e); }
                     }
                 };
                 mapper.do_map(lines_iter, &mut emit);
@@ -400,7 +395,7 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
                 for part in 0..num_reducers {
                     if !thread_local_buffers[part].is_empty() {
                         let chunk = std::mem::take(&mut thread_local_buffers[part]);
-                        if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
+                        if let Err(e) = writer_pool.write_chunk(part, chunk) { error!("writer_pool write_chunk failed: {}", e); }
                     }
                 }
             });
@@ -538,81 +533,4 @@ fn run_reduce_phase<R: Reducer + Send + Sync + 'static>(
     out
 }
 
-enum WriterMsg {
-    Data(Vec<u8>),
-    Flush,
-    Close,
-}
-
-struct WriterJoiner {
-    handles: Vec<thread::JoinHandle<()>>,
-}
-
-impl WriterJoiner { fn join_all(&mut self) { for h in self.handles.drain(..) { let _ = h.join(); } } }
-
-impl WriterPool {
-    fn new(base_dir: String, node_id: usize, num_partitions: usize, flush_bytes: usize, flush_interval: Duration) -> Result<(Self, WriterJoiner)> {
-        ensure_dir(&base_dir)?;
-        let mut senders = Vec::with_capacity(num_partitions);
-        let mut handles = Vec::with_capacity(num_partitions);
-        for part in 0..num_partitions {
-            let (tx, rx) = channel::bounded::<WriterMsg>(1024);
-            let path = format!("{}/task{}_part{}.tsv", base_dir, node_id, part);
-            let handle = thread::spawn(move || {
-                let mut writer = match open_writer(&path) { Ok(w) => w, Err(e) => { error!("open_writer {}: {}", path, e); return; } };
-                let mut buf: Vec<u8> = Vec::with_capacity(flush_bytes);
-                let mut last_flush = Instant::now();
-                loop {
-                    let timeout = flush_interval.saturating_sub(last_flush.elapsed());
-                    let msg_opt = rx.recv_timeout(timeout).ok();
-                    match msg_opt {
-                        Some(WriterMsg::Data(mut bytes)) => {
-                            buf.extend_from_slice(&bytes);
-                        }
-                        Some(WriterMsg::Flush) => {}
-                        Some(WriterMsg::Close) => {
-                            if !buf.is_empty() {
-                                if let Err(e) = writer.write_all(&buf) { error!("writer write_all: {}", e); }
-                                buf.clear();
-                            }
-                            if let Err(e) = writer.flush() { error!("writer flush: {}", e); }
-                            break;
-                        }
-                        None => {}
-                    }
-                    if buf.len() >= flush_bytes || last_flush.elapsed() >= flush_interval {
-                        if !buf.is_empty() {
-                            if let Err(e) = writer.write_all(&buf) { error!("writer write_all: {}", e); }
-                            buf.clear();
-                        }
-                        if let Err(e) = writer.flush() { error!("writer flush: {}", e); }
-                        last_flush = Instant::now();
-                    }
-                }
-            });
-            senders.push(tx);
-            handles.push(handle);
-        }
-        Ok((Self { senders }, WriterJoiner { handles }))
-    }
-
-    fn send<K: Serialize, V: Serialize>(&self, partition: usize, key: &K, value: &V) -> Result<()> {
-        let key_str = serde_json::to_string(key)?;
-        let value_str = serde_json::to_string(value)?;
-        let mut line = Vec::with_capacity(key_str.len() + value_str.len() + 2);
-        line.extend_from_slice(key_str.as_bytes());
-        line.push(b'\t');
-        line.extend_from_slice(value_str.as_bytes());
-        line.push(b'\n');
-        self.senders[partition].send(WriterMsg::Data(line)).map_err(|e| anyhow::anyhow!("send failed: {}", e))
-    }
-
-    fn send_raw(&self, partition: usize, bytes: Vec<u8>) -> Result<()> {
-        self.senders[partition].send(WriterMsg::Data(bytes)).map_err(|e| anyhow::anyhow!("send failed: {}", e))
-    }
-
-    fn close_all(&self) {
-        for tx in &self.senders { let _ = tx.send(WriterMsg::Close); }
-        // Note: we cannot join here because we don't own the handles; provide separate join
-    }
-}
+// WriterPool API is used below

@@ -1,0 +1,9 @@
+bjorn_wcount_*.err
+bjorn_wcount_*.out
+.bjorn_runs/
+external_repos/
+# Rust build artifacts
+/target/
+*.err
+*.out
+*.tsv

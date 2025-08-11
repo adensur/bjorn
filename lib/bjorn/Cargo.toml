@@ -1,0 +1,25 @@
+[package]
+name = "bjorn"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "bjorn"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+num_cpus = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+glob = "0.3"
+libc = "0.2"
+crossbeam-channel = "0.5"

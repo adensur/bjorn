@@ -10,7 +10,8 @@ pub struct SortOutcome {
     pub lines_in: u64,
     pub bytes_in: u64,
     pub sort_only_ms: u64,
-    pub io_read_ms: u64,
+    pub mmap_ms: u64,
+    pub scan_ms: u64,
     pub io_write_ms: u64,
 }
 
@@ -22,18 +23,21 @@ pub fn external_sort_by_key(input_paths: &[String], out_path: &str) -> Result<So
     let mut all_lines: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut bytes_in: u64 = 0;
     let mut lines_in: u64 = 0;
-    let mut io_read = Duration::from_nanos(0);
+    let mut mmap_time = Duration::from_nanos(0);
+    let mut scan_time = Duration::from_nanos(0);
 
     for p in input_paths {
         match std::fs::File::open(&p) {
             Ok(file) => {
                 let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
                 bytes_in += meta_len as u64;
-                let read_start = Instant::now();
+                let mmap_start = Instant::now();
                 match unsafe { Mmap::map(&file) } {
                     Ok(map) => {
                         let file_idx = file_maps.len();
                         let bytes = &map[..];
+                        mmap_time += mmap_start.elapsed();
+                        let scan_start = Instant::now();
                         let mut off = 0usize;
                         while let Some((k, _v, next)) = read_bin_line(bytes, off) {
                             let key_start = off + 8; // after 2 u32 lengths
@@ -43,11 +47,11 @@ pub fn external_sort_by_key(input_paths: &[String], out_path: &str) -> Result<So
                             lines_in += 1;
                             off = next;
                         }
+                        scan_time += scan_start.elapsed();
                         file_maps.push(map);
                     }
                     Err(_e) => {}
                 }
-                io_read += read_start.elapsed();
             }
             Err(_e) => {}
         }
@@ -75,5 +79,5 @@ pub fn external_sort_by_key(input_paths: &[String], out_path: &str) -> Result<So
     }
     let io_write_ms = io_write_start.elapsed().as_millis() as u64;
 
-    Ok(SortOutcome { lines_in, bytes_in, sort_only_ms, io_read_ms: io_read.as_millis() as u64, io_write_ms })
+    Ok(SortOutcome { lines_in, bytes_in, sort_only_ms, mmap_ms: mmap_time.as_millis() as u64, scan_ms: scan_time.as_millis() as u64, io_write_ms })
 }

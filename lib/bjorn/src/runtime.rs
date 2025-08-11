@@ -138,7 +138,8 @@ impl ExecutablePipeline for RuntimePipeline {
         // Writer pool shared within the process
         let flush_bytes = std::env::var("BJORN_FLUSH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16 * 1024 * 1024);
         let flush_interval_ms = std::env::var("BJORN_FLUSH_INTERVAL_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(200);
-        let (pool_inner, pool_joiner) = WriterPool::new(map_out_dir.clone(), slurm.node_id, num_reducers, flush_bytes, Duration::from_millis(flush_interval_ms))?;
+        let queue_cap = std::env::var("BJORN_WRITER_QUEUE_CAP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
+        let (pool_inner, pool_joiner) = WriterPool::new(map_out_dir.clone(), slurm.node_id, num_reducers, flush_bytes, Duration::from_millis(flush_interval_ms), queue_cap)?;
         let writer_pool = Arc::new(pool_inner);
         let mut writer_joiner = pool_joiner;
         // ========== Map phase (inner, env-agnostic) ==========
@@ -202,13 +203,24 @@ impl ExecutablePipeline for RuntimePipeline {
             let total_bytes: u64 = sort_stats_vec.iter().map(|s| s.bytes_in).sum();
             let min_wall = sort_stats_vec.iter().map(|s| s.wall_ms).min().unwrap_or(0);
             let max_wall = sort_stats_vec.iter().map(|s| s.wall_ms).max().unwrap_or(0);
+            let total_sort_ms: u64 = sort_stats_vec.iter().map(|s| s.sort_ms).sum();
+            let total_mmap_ms: u64 = sort_stats_vec.iter().map(|s| s.io_read_ms).sum();
+            let total_scan_ms: u64 = sort_stats_vec.iter().map(|s| s.scan_ms).sum();
+            let total_io_write_ms: u64 = sort_stats_vec.iter().map(|s| s.io_write_ms).sum();
             stats.record_sort(sort_stats_vec.len(), total_lines, total_bytes, min_wall, max_wall, sort_phase_ms);
             if let Some(ss) = &stats.sort {
                 info!(phase = "sort",
                       reducers = ss.reducers, total_lines = ss.total_lines, total_bytes = ss.total_bytes,
+                      total_sort_ms = total_sort_ms, total_mmap_ms = total_mmap_ms, total_scan_ms = total_scan_ms, total_io_write_ms = total_io_write_ms,
                       min_reducer_ms = ss.min_reducer_ms, max_reducer_ms = ss.max_reducer_ms,
                       wall_ms = ss.wall_ms,
                       "Sort phase complete");
+            }
+            // Emit writer pool metrics snapshot for visibility
+            let wp_metrics = writer_pool.metrics_snapshot();
+            let hot = wp_metrics.iter().enumerate().max_by_key(|(_, m)| m.queue_len).map(|(i, m)| (i, m.queue_len, m.max_queue_len, m.avg_enqueue_wait_ms));
+            if let Some((part, q, qmax, wait_ms)) = hot {
+                info!(component = "writer_pool", hottest_partition = part, queue_len = q, max_queue_len = qmax, avg_enqueue_wait_ms = wait_ms, "Writer pool metrics snapshot");
             }
         }
 
@@ -236,10 +248,15 @@ impl ExecutablePipeline for RuntimePipeline {
             let total_groups: u64 = reduce_stats_vec.iter().map(|s| s.groups).sum();
             let min_wall = reduce_stats_vec.iter().map(|s| s.wall_ms).min().unwrap_or(0);
             let max_wall = reduce_stats_vec.iter().map(|s| s.wall_ms).max().unwrap_or(0);
+            let total_parse_ms: u64 = reduce_stats_vec.iter().map(|s| s.parse_ms).sum();
+            let total_reduce_ms: u64 = reduce_stats_vec.iter().map(|s| s.reduce_ms).sum();
+            let total_write_ms: u64 = reduce_stats_vec.iter().map(|s| s.write_ms).sum();
+            let total_io_read_ms: u64 = reduce_stats_vec.iter().map(|s| s.io_read_ms).sum();
             stats.record_reduce(reduce_stats_vec.len(), total_lines, total_groups, min_wall, max_wall, reduce_phase_ms);
             if let Some(rs) = &stats.reduce {
                 info!(phase = "reduce",
                       reducers = rs.reducers, total_lines = rs.total_lines, total_groups = rs.total_groups,
+                      total_parse_ms = total_parse_ms, total_reduce_ms = total_reduce_ms, total_write_ms = total_write_ms, total_io_read_ms = total_io_read_ms,
                       min_reducer_ms = rs.min_reducer_ms, max_reducer_ms = rs.max_reducer_ms,
                       wall_ms = rs.wall_ms,
                       "Reduce phase complete");
@@ -296,7 +313,16 @@ struct MapTaskStats {
 }
 
 #[derive(Clone, Debug)]
-struct SortReducerWall { reducer: u64, lines_in: u64, bytes_in: u64, wall_ms: u64 }
+struct SortReducerWall {
+    reducer: u64,
+    lines_in: u64,
+    bytes_in: u64,
+    sort_ms: u64,
+    io_read_ms: u64, // mmap time
+    scan_ms: u64,
+    io_write_ms: u64,
+    wall_ms: u64,
+}
 
 #[derive(Clone, Debug)]
 struct ReduceStats {
@@ -306,6 +332,7 @@ struct ReduceStats {
     parse_ms: u64,
     reduce_ms: u64,
     write_ms: u64,
+    io_read_ms: u64,
     wall_ms: u64,
 }
 
@@ -427,7 +454,16 @@ fn run_sort_phase(my_reducers: &[usize], map_out_dir: &str, sort_out_dir: &str, 
                 let barrier_path = format!("{}/barrier_sort_done_{}", launch_root, r);
                 let _ = fs::write(&barrier_path, b"ok");
                 let mut guard = sort_stats.lock().unwrap();
-                guard.push(SortReducerWall { reducer: r as u64, lines_in: outcome.lines_in, bytes_in: outcome.bytes_in, wall_ms: reducer_start.elapsed().as_millis() as u64 });
+                guard.push(SortReducerWall {
+                    reducer: r as u64,
+                    lines_in: outcome.lines_in,
+                    bytes_in: outcome.bytes_in,
+                    sort_ms: outcome.sort_only_ms,
+                    io_read_ms: outcome.mmap_ms,
+                    scan_ms: outcome.scan_ms,
+                    io_write_ms: outcome.io_write_ms,
+                    wall_ms: reducer_start.elapsed().as_millis() as u64,
+                });
             }
             Err(e) => error!("external_sort_by_key failed for reducer {}: {}", r, e),
         }
@@ -449,9 +485,11 @@ fn run_reduce_phase<R: Reducer + Send + Sync + 'static>(
     let run_reduce_for = |r: usize| {
         let reducer_start = Instant::now();
         let in_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
+        let io_read_start = Instant::now();
         let file = match std::fs::File::open(&in_path) { Ok(f) => f, Err(e) => { error!("open {}: {}", in_path, e); return; } };
         let map = match unsafe { Mmap::map(&file) } { Ok(m) => m, Err(e) => { error!("mmap {}: {}", in_path, e); return; } };
         let bytes = &map[..];
+        let io_read_ms = io_read_start.elapsed().as_millis() as u64;
 
         let mut current_key: Option<R::Key> = None;
         let mut buffer: Vec<R::ValueIn> = Vec::new();
@@ -505,6 +543,7 @@ fn run_reduce_phase<R: Reducer + Send + Sync + 'static>(
             parse_ms: parse_time.as_millis() as u64,
             reduce_ms: reduce_time.as_millis() as u64,
             write_ms: write_time.as_millis() as u64,
+            io_read_ms,
             wall_ms: reducer_start.elapsed().as_millis() as u64,
         });
     };

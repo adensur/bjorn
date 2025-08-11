@@ -16,12 +16,11 @@ pub trait Mapper {
 pub trait Reducer {
     type Key: Send + Serialize + DeserializeOwned + Hash + Eq + Clone + 'static;
     type ValueIn: Send + Serialize + DeserializeOwned + Clone + 'static;
-    type ValueOut: Send + Serialize + DeserializeOwned + Clone + 'static;
 
     fn do_reduce<I, F>(&self, key: &Self::Key, values: I, emit: &mut F)
     where
         I: IntoIterator<Item = Self::ValueIn>,
-        F: FnMut(Self::Key, Self::ValueOut);
+        F: FnMut(String);
 }
 
 pub struct Pipeline {}
@@ -56,5 +55,5 @@ pub trait ExecutablePipeline {
     fn map_reduce<M, R>(&mut self, mapper: M, reducer: R) -> Result<()>
     where
         M: Mapper<Input = String> + Send + Sync + 'static,
-        R: Reducer<Key = M::Key, ValueIn = M::Value, ValueOut = M::Value> + Send + Sync + 'static;
+        R: Reducer<Key = M::Key, ValueIn = M::Value> + Send + Sync + 'static;
 }

@@ -42,15 +42,14 @@ struct WordcountReducer;
 impl Reducer for WordcountReducer {
     type Key = String;
     type ValueIn = u64;
-    type ValueOut = u64;
 
     fn do_reduce<I, F>(&self, key: &Self::Key, values: I, emit: &mut F)
     where
         I: IntoIterator<Item = Self::ValueIn>,
-        F: FnMut(Self::Key, Self::ValueOut),
+        F: FnMut(String),
     {
         let sum: u64 = values.into_iter().sum();
-        emit(key.clone(), sum);
+        emit(format!("\"{}\"\t{}", key, sum));
     }
 }
 

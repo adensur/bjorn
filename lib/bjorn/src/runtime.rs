@@ -1,10 +1,12 @@
 use crate::api::{ExecutablePipeline, Mapper, Reducer};
-use crate::io::{ensure_dir, hash_to_partition, list_files_recursive, open_reader, open_writer, read_lines, write_tsv};
+use crate::io::{ensure_dir, hash_to_partition, list_files_recursive, open_reader, open_writer, read_lines, write_bin, read_bin_line, decode_bin, write_tsv};
 use crate::slurm::SlurmEnv;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs;
 use std::io::{BufRead, Write};
+use memmap2::Mmap;
+use memchr::memchr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, debug};
@@ -69,7 +71,7 @@ impl ExecutablePipeline for RuntimePipeline {
     fn map_reduce<M, R>(&mut self, mapper: M, reducer: R) -> Result<()>
     where
         M: Mapper<Input = String> + Send + Sync + 'static,
-        R: Reducer<Key = M::Key, ValueIn = M::Value, ValueOut = M::Value> + Send + Sync + 'static,
+        R: Reducer<Key = M::Key, ValueIn = M::Value> + Send + Sync + 'static,
     {
         let slurm = SlurmEnv::detect().unwrap_or({
             let pid = std::process::id();
@@ -122,19 +124,30 @@ impl ExecutablePipeline for RuntimePipeline {
             all_files.append(&mut files);
         }
 
-        // partition files among tasks
-        let ntasks = slurm.ntasks.max(1).min(all_files.len().max(1));
-        let chunks: Vec<Vec<PathBuf>> = (0..ntasks)
-            .map(|i| all_files.iter().cloned().enumerate().filter(|(idx, _)| idx % ntasks == i).map(|(_, p)| p).collect())
+        // Determine task topology
+        let is_slurm = SlurmEnv::is_slurm();
+        let local_subtasks = if is_slurm {
+            std::env::var("BJORN_LOCAL_SUBTASKS").ok().and_then(|v| v.parse::<usize>().ok())
+                .or_else(|| std::env::var("SLURM_CPUS_PER_TASK").ok().and_then(|v| v.parse::<usize>().ok()))
+                .unwrap_or_else(|| num_cpus::get())
+                .max(1)
+        } else { 1 };
+        let global_ntasks_raw = if is_slurm { slurm.ntasks.max(1) * local_subtasks } else { slurm.ntasks.max(1) };
+        let global_ntasks = global_ntasks_raw.min(all_files.len().max(1));
+
+        // partition files among logical tasks
+        let chunks: Vec<Vec<PathBuf>> = (0..global_ntasks)
+            .map(|i| all_files.iter().cloned().enumerate().filter(|(idx, _)| idx % global_ntasks == i).map(|(_, p)| p).collect())
             .collect();
 
         let mapper = Arc::new(mapper);
-        let num_reducers = std::env::var("BJORN_NUM_REDUCERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(ntasks).clamp(1, ntasks);
+        let default_reducers = if is_slurm { slurm.ntasks.max(1) } else { global_ntasks };
+        let num_reducers = std::env::var("BJORN_NUM_REDUCERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default_reducers).clamp(1, default_reducers);
 
         // Log environment and limits
         let fd_limit = get_fd_soft_limit();
         info!(
-            slurm = %SlurmEnv::is_slurm(), job_id = %slurm.job_id, node_id = slurm.node_id, ntasks = ntasks, num_reducers = num_reducers,
+            slurm = %SlurmEnv::is_slurm(), job_id = %slurm.job_id, node_id = slurm.node_id, ntasks = global_ntasks, num_reducers = num_reducers,
             fd_soft_limit = fd_limit.unwrap_or(0),
             "Bjorn starting map phase"
         );
@@ -149,7 +162,6 @@ impl ExecutablePipeline for RuntimePipeline {
         // Map phase
         let map_stats: Arc<Mutex<Vec<MapTaskStats>>> = Arc::new(Mutex::new(Vec::new()));
         let map_phase_start = Instant::now();
-        let is_slurm = SlurmEnv::is_slurm();
         let run_map_for = |task_id: usize| {
             let task_start = Instant::now();
             let files = &chunks[task_id];
@@ -175,16 +187,16 @@ impl ExecutablePipeline for RuntimePipeline {
                 let mut emit = |k: M::Key, v: M::Value| {
                     let emit_start = Instant::now();
                     let part = hash_to_partition(&k, num_reducers);
-                    let key_str = match serde_json::to_string(&k) { Ok(s) => s, Err(e) => { error!("serde key: {}", e); return; } };
-                    let value_str = match serde_json::to_string(&v) { Ok(s) => s, Err(e) => { error!("serde val: {}", e); return; } };
                     let buf = &mut local_buffers[part];
-                    buf.extend_from_slice(key_str.as_bytes());
-                    buf.push(b'\t');
-                    buf.extend_from_slice(value_str.as_bytes());
-                    buf.push(b'\n');
-                    if buf.len() >= LOCAL_BATCH_BYTES {
-                        flush_part(part, &writer_pool, local_buffers);
-                    }
+                    // append a binary record
+                    let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
+                    let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
+                    let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
+                    buf.extend_from_slice(&klen.to_le_bytes());
+                    buf.extend_from_slice(&vlen.to_le_bytes());
+                    buf.extend_from_slice(&key_bytes);
+                    buf.extend_from_slice(&val_bytes);
+                    if buf.len() >= LOCAL_BATCH_BYTES { flush_part(part, &writer_pool, local_buffers); }
                     total_emits += 1;
                     total_emit_time += emit_start.elapsed();
                 };
@@ -200,13 +212,14 @@ impl ExecutablePipeline for RuntimePipeline {
                     let lines = match read_lines(file) { Ok(it) => it, Err(e) => { error!("read_lines {}: {}", file.display(), e); return; } };
                     let mut emit = |k: M::Key, v: M::Value| {
                         let part = hash_to_partition(&k, num_reducers);
-                        let key_str = match serde_json::to_string(&k) { Ok(s) => s, Err(e) => { error!("serde key: {}", e); return; } };
-                        let value_str = match serde_json::to_string(&v) { Ok(s) => s, Err(e) => { error!("serde val: {}", e); return; } };
                         let buf = &mut thread_local_buffers[part];
-                        buf.extend_from_slice(key_str.as_bytes());
-                        buf.push(b'\t');
-                        buf.extend_from_slice(value_str.as_bytes());
-                        buf.push(b'\n');
+                        let key_bytes = match bincode::serialize(&k) { Ok(b) => b, Err(e) => { error!("bincode key: {}", e); return; } };
+                        let val_bytes = match bincode::serialize(&v) { Ok(b) => b, Err(e) => { error!("bincode val: {}", e); return; } };
+                        let klen = key_bytes.len() as u32; let vlen = val_bytes.len() as u32;
+                        buf.extend_from_slice(&klen.to_le_bytes());
+                        buf.extend_from_slice(&vlen.to_le_bytes());
+                        buf.extend_from_slice(&key_bytes);
+                        buf.extend_from_slice(&val_bytes);
                         if buf.len() >= LOCAL_BATCH_BYTES {
                             let chunk = std::mem::take(buf);
                             if let Err(e) = writer_pool.send_raw(part, chunk) { error!("writer_pool send_raw failed: {}", e); }
@@ -243,17 +256,22 @@ impl ExecutablePipeline for RuntimePipeline {
             });
         };
 
-        if SlurmEnv::is_slurm() {
-            run_map_for(slurm.node_id);
+        if is_slurm {
+            // Run this process's logical subtasks: ids are node_id + k * slurm.ntasks
+            let my_task_ids: Vec<usize> = (0..local_subtasks)
+                .map(|k| slurm.node_id + k * slurm.ntasks)
+                .filter(|&id| id < global_ntasks)
+                .collect();
+            my_task_ids.into_par_iter().for_each(|task_id| run_map_for(task_id));
         } else {
             // local: still run tasks in parallel
-            (0..ntasks).into_par_iter().for_each(|task_id| run_map_for(task_id));
+            (0..global_ntasks).into_par_iter().for_each(|task_id| run_map_for(task_id));
         }
 
         // wait for all tasks to finish map when under slurm
-        if SlurmEnv::is_slurm() {
+        if is_slurm {
             let t0 = Instant::now();
-            wait_for_barrier(&launch_root, "map_done", ntasks);
+            wait_for_barrier(&launch_root, "map_done", global_ntasks);
             info!(phase = "barrier_map_wait", wait_ms = t0.elapsed().as_millis() as u64, "Barrier wait for map phase completed");
         }
 
@@ -286,37 +304,59 @@ impl ExecutablePipeline for RuntimePipeline {
             let pattern = format!("{}/task*_part{}.tsv", map_out_dir, r);
             let mut paths = match glob::glob(&pattern) { Ok(g) => g.flatten().collect::<Vec<_>>(), Err(e) => { error!("glob error: {}", e); Vec::new() } };
             paths.sort();
-            // Store each line plus the position of the first tab (end of key)
-            let mut all_lines: Vec<(String, usize)> = Vec::new();
+
+            // Mmap each input file and build record index: (file_idx, start, key_end, end)
+            let mut file_maps: Vec<Mmap> = Vec::new();
+            let mut all_lines: Vec<(usize, usize, usize, usize)> = Vec::new();
             let mut bytes_in: u64 = 0;
             let mut lines_in: u64 = 0;
             let mut io_read = Duration::from_nanos(0);
+
             for p in &paths {
-                match std::fs::File::open(&p) { Ok(file) => {
-                    let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                    bytes_in += meta_len as u64;
-                    let read_start = Instant::now();
-                    let reader = std::io::BufReader::new(file);
-                    for line in reader.lines().flatten() {
-                        if !line.is_empty() {
-                            let key_end = line.as_bytes().iter().position(|&b| b == b'\t').unwrap_or(line.len());
-                            all_lines.push((line, key_end));
-                            lines_in += 1;
+                match std::fs::File::open(&p) {
+                    Ok(file) => {
+                        let meta_len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                        bytes_in += meta_len as u64;
+                        let read_start = Instant::now();
+                        match unsafe { Mmap::map(&file) } {
+                            Ok(map) => {
+                                let file_idx = file_maps.len();
+                                let bytes = &map[..];
+                                let mut off = 0usize;
+                                while let Some((k, v, next)) = read_bin_line(bytes, off) {
+                                    let key_start = off + 8; // after 2 u32 lengths
+                                    let key_end = key_start + k.len();
+                                    let end = next;
+                                    all_lines.push((file_idx, key_start - 8, key_end, end));
+                                    lines_in += 1;
+                                    off = next;
+                                }
+                                file_maps.push(map);
+                            }
+                            Err(e) => error!("mmap {}: {}", p.display(), e),
                         }
+                        io_read += read_start.elapsed();
                     }
-                    io_read += read_start.elapsed();
-                }, Err(e) => { error!("open {}: {}", p.display(), e); } }
+                    Err(e) => { error!("open {}: {}", p.display(), e); }
+                }
             }
+
             let sort_only_start = Instant::now();
-            all_lines.par_sort_by(|a, b| a.0.as_bytes()[..a.1].cmp(&b.0.as_bytes()[..b.1]));
+            all_lines.par_sort_by(|a, b| {
+                let (fia, sa, ka, _ea) = *a;
+                let (fib, sb, kb, _eb) = *b;
+                // Keys are at [sa+8..ka] because [sa..sa+8) holds the lengths
+                file_maps[fia][(sa+8)..ka].cmp(&file_maps[fib][(sb+8)..kb])
+            });
             let sort_only_ms = sort_only_start.elapsed().as_millis() as u64;
+
             let out_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
             let io_write_start = Instant::now();
             match std::fs::File::create(&out_path) {
                 Ok(file) => {
-                    let mut w = std::io::BufWriter::new(file);
-                    for (line, _) in &all_lines {
-                        if let Err(e) = writeln!(w, "{}", line) { error!("write reduce_in {}: {}", out_path, e); break; }
+                    let mut w = std::io::BufWriter::with_capacity(32 * 1024 * 1024, file);
+                    for &(fi, s, _k, e) in &all_lines {
+                        if let Err(e2) = w.write_all(&file_maps[fi][s..e]) { error!("write reduce_in {}: {}", out_path, e2); break; }
                     }
                     if let Err(e) = w.flush() { error!("flush reduce_in {}: {}", out_path, e); }
                 }
@@ -341,7 +381,7 @@ impl ExecutablePipeline for RuntimePipeline {
             });
         };
 
-        if SlurmEnv::is_slurm() {
+        if is_slurm {
             run_sort_for(slurm.node_id);
             // wait for all reducers' sort
             let t0 = Instant::now();
@@ -371,11 +411,12 @@ impl ExecutablePipeline for RuntimePipeline {
         let run_reduce_for = |r: usize| {
             let reducer_start = Instant::now();
             let in_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
-            let reader = match open_reader(&in_path) { Ok(rdr) => rdr, Err(e) => { error!("open_reader {}: {}", in_path, e); return; } };
-            let lines = reader.lines().filter_map(|l| l.ok());
+            let file = match std::fs::File::open(&in_path) { Ok(f) => f, Err(e) => { error!("open {}: {}", in_path, e); return; } };
+            let map = match unsafe { Mmap::map(&file) } { Ok(m) => m, Err(e) => { error!("mmap {}: {}", in_path, e); return; } };
+            let bytes = &map[..];
 
-            let mut current_key: Option<serde_json::Value> = None;
-            let mut buffer: Vec<serde_json::Value> = Vec::new();
+            let mut current_key: Option<R::Key> = None;
+            let mut buffer: Vec<R::ValueIn> = Vec::new();
 
             let mut out_writer = match open_writer(format!("{}/part-{:05}.tsv", output_dir, r)) { Ok(w) => w, Err(e) => { error!("open_writer output: {}", e); return; } };
 
@@ -384,39 +425,37 @@ impl ExecutablePipeline for RuntimePipeline {
             let mut write_time = Duration::from_nanos(0);
             let mut groups: u64 = 0;
 
-            let mut flush_group = |key: &serde_json::Value, vals: &Vec<serde_json::Value>, reducer: &R, out_writer: &mut std::io::BufWriter<std::fs::File>| {
-                let key_typed: R::Key = serde_json::from_value(key.clone()).expect("key type");
-                let vals_typed: Vec<R::ValueIn> = vals.iter().cloned().map(|v| serde_json::from_value(v).expect("val type")).collect();
+            let mut flush_group = |key: &R::Key, vals: &Vec<R::ValueIn>, reducer: &R, out_writer: &mut std::io::BufWriter<std::fs::File>| {
                 let reduce_start = Instant::now();
-                let mut emit = |k: R::Key, v: R::ValueOut| {
+                let mut emit = |line: String| {
                     let w_start = Instant::now();
-                    if let Err(e) = write_tsv(out_writer, &k, &v) { error!("write_tsv reduce: {}", e); }
+                    if let Err(e) = writeln!(out_writer, "{}", line) { error!("write reduce tsv line: {}", e); }
                     write_time += w_start.elapsed();
                 };
-                reducer.do_reduce(&key_typed, vals_typed.into_iter(), &mut emit);
+                reducer.do_reduce(key, vals.clone().into_iter(), &mut emit);
                 reduce_time += reduce_start.elapsed();
                 groups += 1;
             };
 
             let mut lines_in: u64 = 0;
-            for line in lines {
-                if let Some((k_str, v_str)) = line.split_once('\t') {
-                    let p_start = Instant::now();
-                    let k_json: serde_json::Value = match serde_json::from_str(k_str) { Ok(v) => v, Err(e) => { error!("bad key json: {}", e); continue; } };
-                    let v_json: serde_json::Value = match serde_json::from_str(v_str) { Ok(v) => v, Err(e) => { error!("bad val json: {}", e); continue; } };
-                    parse_time += p_start.elapsed();
-                    lines_in += 1;
-                    match &current_key {
-                        None => { current_key = Some(k_json); buffer.clear(); buffer.push(v_json); }
-                        Some(cur) if cur == &k_json => { buffer.push(v_json); }
-                        Some(cur) => {
-                            flush_group(cur, &buffer, &reducer, &mut out_writer);
-                            current_key = Some(k_json);
-                            buffer.clear();
-                            buffer.push(v_json);
-                        }
+            let mut off = 0usize;
+            while let Some((k, v, next)) = read_bin_line(bytes, off) {
+                let p_start = Instant::now();
+                let k_typed: R::Key = match bincode::deserialize(k) { Ok(v) => v, Err(e) => { error!("bad key bin: {}", e); break; } };
+                let v_typed: R::ValueIn = match bincode::deserialize(v) { Ok(v) => v, Err(e) => { error!("bad val bin: {}", e); break; } };
+                parse_time += p_start.elapsed();
+                lines_in += 1;
+                match &current_key {
+                    None => { current_key = Some(k_typed); buffer.clear(); buffer.push(v_typed); }
+                    Some(cur) if cur == &k_typed => { buffer.push(v_typed); }
+                    Some(cur) => {
+                        flush_group(cur, &buffer, &reducer, &mut out_writer);
+                        current_key = Some(k_typed);
+                        buffer.clear();
+                        buffer.push(v_typed);
                     }
                 }
+                off = next;
             }
             if let Some(cur) = current_key.take() { flush_group(&cur, &buffer, &reducer, &mut out_writer); }
             // record stats
@@ -432,7 +471,7 @@ impl ExecutablePipeline for RuntimePipeline {
             });
         };
 
-        if SlurmEnv::is_slurm() {
+        if is_slurm {
             run_reduce_for(slurm.node_id);
             // mark reduce done for this node
             let barrier_path = format!("{}/barrier_reduce_done_{}", launch_root, slurm.node_id);
@@ -440,7 +479,7 @@ impl ExecutablePipeline for RuntimePipeline {
             // only rank0 performs cleanup after all are done
             if slurm.node_id == 0 {
                 let t0 = Instant::now();
-                wait_for_barrier(&launch_root, "reduce_done", ntasks);
+                wait_for_barrier(&launch_root, "reduce_done", slurm.ntasks.max(1));
                 info!(phase = "barrier_reduce_wait", wait_ms = t0.elapsed().as_millis() as u64, "Barrier wait for reduce phase completed");
                 if !keep_intermediates { let _ = fs::remove_dir_all(&launch_root); }
             }

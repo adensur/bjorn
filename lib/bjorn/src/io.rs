@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::collections::hash_map::DefaultHasher;
 use std::io::Read;
+use std::collections::BTreeMap;
 
 pub fn ensure_dir(path: impl AsRef<Path>) -> Result<()> {
     fs::create_dir_all(path.as_ref()).with_context(|| format!("create_dir_all {}", path.as_ref().display()))
@@ -110,8 +111,15 @@ pub trait Format<I>: Send + Sync + 'static {
     fn decode<'a>(&self, r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = I> + Send + 'a>>;
 }
 
-pub trait Sink: Send + Sync {
-    fn open_partition(&self, partition_index: usize) -> Result<Box<dyn std::io::Write + Send>>;
+// ============== Pluggable sinks (generic over output record type) ==============
+
+pub trait PartitionWriter<Out>: Send {
+    fn write(&mut self, record: &Out) -> Result<()>;
+}
+
+pub trait Sink<Out>: Send + Sync + 'static {
+    type Writer: PartitionWriter<Out> + Send;
+    fn open_partition(&self, partition_index: usize) -> Result<Self::Writer>;
 }
 
 // Local FS implementations
@@ -136,12 +144,245 @@ impl Format<String> for TextLineFormat {
     }
 }
 
-pub struct LocalFsSink { pub base: String }
-impl Sink for LocalFsSink {
-    fn open_partition(&self, partition_index: usize) -> Result<Box<dyn std::io::Write + Send>> {
-        let path = format!("{}/part-{:05}.tsv", self.base, partition_index);
+// ============== Parquet dynamic row support ==============
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, PartialOrd)]
+pub enum ParquetValue {
+    Null,
+    Bool(bool),
+    Int64(i64),
+    Double(f64),
+    Bytes(Vec<u8>),
+    String(String),
+    TimestampMicros(i64),
+    List(Vec<ParquetValue>),
+    Map(BTreeMap<String, ParquetValue>),
+}
+
+pub type ParquetRow = BTreeMap<String, ParquetValue>;
+
+pub struct ParquetFormat;
+
+impl Format<ParquetRow> for ParquetFormat {
+    fn decode<'a>(&self, mut r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = ParquetRow> + Send + 'a>> {
+        // Minimal implementation: read into memory and use Bytes for parquet reader
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut *r, &mut buf)?;
+        let bytes = bytes::Bytes::from(buf);
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(bytes)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let boxed: Box<dyn parquet::file::reader::FileReader> = Box::new(reader);
+        let iter = parquet::record::reader::RowIter::from_file_into(boxed);
+        let rows: Vec<ParquetRow> = iter.map(|row_res| row_to_pqrow(&row_res.unwrap())).collect();
+        Ok(Box::new(rows.into_iter()))
+    }
+}
+
+/// Trait implemented by user static types to convert into a dynamic ParquetRow.
+pub trait ParquetRecord {
+    fn to_row(&self) -> ParquetRow;
+}
+
+fn row_to_pqrow(row: &parquet::record::Row) -> ParquetRow {
+    let mut out: ParquetRow = BTreeMap::new();
+    for (name, field) in row.get_column_iter() {
+        out.insert(name.to_string(), field_to_pqval(field));
+    }
+    out
+}
+
+fn field_to_pqval(field: &parquet::record::Field) -> ParquetValue {
+    use parquet::record::Field as F;
+    match field {
+        F::Null => ParquetValue::Null,
+        F::Bool(b) => ParquetValue::Bool(*b),
+        F::Byte(b) => ParquetValue::Int64(*b as i64),
+        F::Short(s) => ParquetValue::Int64(*s as i64),
+        F::Int(i) => ParquetValue::Int64(*i as i64),
+        F::Long(l) => ParquetValue::Int64(*l),
+        F::UByte(b) => ParquetValue::Int64(*b as i64),
+        F::UShort(s) => ParquetValue::Int64(*s as i64),
+        F::UInt(i) => ParquetValue::Int64(*i as i64),
+        F::ULong(l) => ParquetValue::Int64(*l as i64),
+        F::Float(f) => ParquetValue::Double(*f as f64),
+        F::Double(d) => ParquetValue::Double(*d),
+        F::Bytes(b) => ParquetValue::Bytes(b.data().to_vec()),
+        F::Str(s) => ParquetValue::String(s.clone()),
+        F::TimestampMicros(v) => ParquetValue::TimestampMicros(*v),
+        F::ListInternal(_list) => ParquetValue::List(Vec::new()),
+        F::MapInternal(_map) => ParquetValue::Map(BTreeMap::new()),
+        F::Group(g) => {
+            let mut m = BTreeMap::new();
+            for (name, field) in g.get_column_iter() { m.insert(name.to_string(), field_to_pqval(field)); }
+            ParquetValue::Map(m)
+        }
+        _ => ParquetValue::Null,
+    }
+}
+
+/// Text line sink: expects reducer to emit a `String` per record. Writes one line per record.
+pub struct TextLineSink { pub base: String }
+
+pub struct TextLineWriter { inner: BufWriter<File> }
+
+impl PartitionWriter<String> for TextLineWriter {
+    fn write(&mut self, record: &String) -> Result<()> {
+        writeln!(self.inner, "{}", record).map_err(anyhow::Error::from)
+    }
+}
+
+// (removed specialized (String, i64) Parquet sink in favor of generic ParquetRowSink)
+
+// ============== Generic Parquet sink for ParquetRow (flat schema, explicit types) ==============
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParquetFieldType { Bool, Int64, Double, String, Bytes, TimestampMicros }
+
+pub struct ParquetRowSink { pub base: String, pub schema: BTreeMap<String, ParquetFieldType> }
+
+pub struct ParquetRowWriter { path: String, schema: BTreeMap<String, ParquetFieldType>, rows: Vec<ParquetRow> }
+
+impl PartitionWriter<ParquetRow> for ParquetRowWriter {
+    fn write(&mut self, record: &ParquetRow) -> Result<()> {
+        self.rows.push(record.clone());
+        Ok(())
+    }
+}
+
+impl Drop for ParquetRowWriter {
+    fn drop(&mut self) {
+        if let Err(e) = write_parquet_rows(&self.path, &self.schema, &self.rows) {
+            eprintln!("ParquetRowWriter flush error: {}", e);
+        }
+    }
+}
+
+impl Sink<ParquetRow> for ParquetRowSink {
+    type Writer = ParquetRowWriter;
+    fn open_partition(&self, partition_index: usize) -> Result<Self::Writer> {
+        ensure_dir(&self.base)?;
+        let path = format!("{}/part-{:05}.parquet", self.base, partition_index);
+        Ok(ParquetRowWriter { path, schema: self.schema.clone(), rows: Vec::new() })
+    }
+}
+
+fn write_parquet_rows(path: &str, schema_map: &BTreeMap<String, ParquetFieldType>, rows: &[ParquetRow]) -> Result<()> {
+    use parquet::basic::Compression;
+    use parquet::data_type::ByteArray;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
+
+    // Build schema message with OPTIONAL fields from provided schema
+    let mut fields = String::new();
+    for (name, ct) in schema_map.iter() {
+        let (phys, annot): (&str, Option<&str>) = match ct {
+            ParquetFieldType::Bool => ("BOOLEAN", None),
+            ParquetFieldType::Int64 => ("INT64", None),
+            ParquetFieldType::Double => ("DOUBLE", None),
+            ParquetFieldType::String => ("BINARY", Some("(UTF8)")),
+            ParquetFieldType::Bytes => ("BINARY", None),
+            ParquetFieldType::TimestampMicros => ("INT64", None),
+        };
+        match annot {
+            Some(a) => fields.push_str(&format!(" OPTIONAL {} {} {} ;", phys, name, a)),
+            None => fields.push_str(&format!(" OPTIONAL {} {} ;", phys, name)),
+        }
+    }
+    let schema_str = format!("message schema {{{}}}", fields);
+    let schema = parse_message_type(&schema_str).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // Open writer
+    let props = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
+    let file = std::fs::File::create(path)?;
+    let mut writer = SerializedFileWriter::new(file, std::sync::Arc::new(schema), std::sync::Arc::new(props))?;
+
+    let mut row_group = writer.next_row_group()?;
+    // For each column, materialize values + def levels
+    for (name, ct) in schema_map.iter() {
+        if let Some(mut col_writer) = row_group.next_column()? {
+            match ct {
+                ParquetFieldType::Bool => {
+                    let mut values: Vec<bool> = Vec::new();
+                    let mut def: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match row.get(name) {
+                            Some(ParquetValue::Bool(b)) => { values.push(*b); def.push(1); }
+                            Some(ParquetValue::Null) | None => { def.push(0); }
+                            _ => return Err(anyhow::anyhow!("column {} type mismatch", name)),
+                        }
+                    }
+                    let typed = col_writer.typed::<parquet::data_type::BoolType>();
+                    typed.write_batch(&values, Some(&def), None)?;
+                }
+                ParquetFieldType::Int64 | ParquetFieldType::TimestampMicros => {
+                    let mut values: Vec<i64> = Vec::new();
+                    let mut def: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match row.get(name) {
+                            Some(ParquetValue::Int64(v)) => { values.push(*v); def.push(1); }
+                            Some(ParquetValue::TimestampMicros(v)) => { values.push(*v); def.push(1); }
+                            Some(ParquetValue::Null) | None => { def.push(0); }
+                            _ => return Err(anyhow::anyhow!("column {} type mismatch", name)),
+                        }
+                    }
+                    let typed = col_writer.typed::<parquet::data_type::Int64Type>();
+                    typed.write_batch(&values, Some(&def), None)?;
+                }
+                ParquetFieldType::Double => {
+                    let mut values: Vec<f64> = Vec::new();
+                    let mut def: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match row.get(name) {
+                            Some(ParquetValue::Double(v)) => { values.push(*v); def.push(1); }
+                            Some(ParquetValue::Int64(v)) => { values.push(*v as f64); def.push(1); }
+                            Some(ParquetValue::Null) | None => { def.push(0); }
+                            _ => return Err(anyhow::anyhow!("column {} type mismatch", name)),
+                        }
+                    }
+                    let typed = col_writer.typed::<parquet::data_type::DoubleType>();
+                    typed.write_batch(&values, Some(&def), None)?;
+                }
+                ParquetFieldType::String => {
+                    let mut values: Vec<ByteArray> = Vec::new();
+                    let mut def: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match row.get(name) {
+                            Some(ParquetValue::String(s)) => { values.push(ByteArray::from(s.as_str())); def.push(1); }
+                            Some(ParquetValue::Null) | None => { def.push(0); }
+                            _ => return Err(anyhow::anyhow!("column {} type mismatch", name)),
+                        }
+                    }
+                    let typed = col_writer.typed::<parquet::data_type::ByteArrayType>();
+                    typed.write_batch(&values, Some(&def), None)?;
+                }
+                ParquetFieldType::Bytes => {
+                    let mut values: Vec<ByteArray> = Vec::new();
+                    let mut def: Vec<i16> = Vec::new();
+                    for row in rows {
+                        match row.get(name) {
+                            Some(ParquetValue::Bytes(b)) => { values.push(ByteArray::from(b.as_slice())); def.push(1); }
+                            Some(ParquetValue::Null) | None => { def.push(0); }
+                            _ => return Err(anyhow::anyhow!("column {} type mismatch", name)),
+                        }
+                    }
+                    let typed = col_writer.typed::<parquet::data_type::ByteArrayType>();
+                    typed.write_batch(&values, Some(&def), None)?;
+                }
+            }
+            col_writer.close()?;
+        }
+    }
+    row_group.close()?;
+    writer.close()?;
+    Ok(())
+}
+
+impl Sink<String> for TextLineSink {
+    type Writer = TextLineWriter;
+    fn open_partition(&self, partition_index: usize) -> Result<Self::Writer> {
+        let path = format!("{}/part-{:05}.txt", self.base, partition_index);
         let w = open_writer(path)?;
-        Ok(Box::new(w))
+        Ok(TextLineWriter { inner: w })
     }
 }
 
@@ -205,4 +446,6 @@ impl Source for S3Source {
         Ok(Box::new(std::io::Cursor::new(data)))
     }
 }
+
+// (duplicate removed)
 

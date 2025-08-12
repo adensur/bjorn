@@ -61,6 +61,7 @@ def main():
     ap.add_argument("--lines", type=int, default=10000)
     ap.add_argument("--words-per-line", type=int, default=50)
     ap.add_argument("--jobs", type=int, default=32, help="Number of parallel worker processes")
+    ap.add_argument("--format", choices=["text", "parquet"], default="text")
     ap.add_argument("--seed", type=int, default=None, help="Base RNG seed for reproducible data")
     ap.add_argument("--buffer-lines", type=int, default=10000, help="Flush to disk every N lines (per file)")
     ap.add_argument("--progress-per-file", action="store_true", help="Show per-file progress bars (when jobs=1)")
@@ -71,32 +72,47 @@ def main():
 
     total_lines = args.files * args.lines
 
-    # Single-process with optional per-file progress
-    if args.jobs <= 1:
-        outer = tqdm(total=total_lines, desc="generating", unit="lines")
-        for i in range(args.files):
-            written = write_one_file(
-                i, str(out), args.lines, args.words_per_line, args.seed, args.buffer_lines, args.progress_per_file
-            )
-            outer.update(written)
-        outer.close()
-        return
+    if args.format == "text":
+        # Single-process with optional per-file progress
+        if args.jobs <= 1:
+            outer = tqdm(total=total_lines, desc="generating", unit="lines")
+            for i in range(args.files):
+                written = write_one_file(
+                    i, str(out), args.lines, args.words_per_line, args.seed, args.buffer_lines, args.progress_per_file
+                )
+                outer.update(written)
+            outer.close()
+            return
 
     # Multi-process: progress is tracked at the granularity of files completed
     from multiprocessing import Pool
 
-    tasks = [
-        (i, str(out), args.lines, args.words_per_line, args.seed, args.buffer_lines, False)
-        for i in range(args.files)
-    ]
+    if args.format == "text":
+        tasks = [
+            (i, str(out), args.lines, args.words_per_line, args.seed, args.buffer_lines, False)
+            for i in range(args.files)
+        ]
 
-    progress_bar = tqdm(total=total_lines, desc="generating", unit="lines")
+        progress_bar = tqdm(total=total_lines, desc="generating", unit="lines")
 
-    with Pool(processes=args.jobs) as pool:
-        # Each completed file accounts for args.lines lines
-        for _ in pool.imap_unordered(_worker_star, tasks, chunksize=1):
-            progress_bar.update(args.lines)
-    progress_bar.close()
+        with Pool(processes=args.jobs) as pool:
+            # Each completed file accounts for args.lines lines
+            for _ in pool.imap_unordered(_worker_star, tasks, chunksize=1):
+                progress_bar.update(args.lines)
+        progress_bar.close()
+    else:
+        # parquet generation in Python requires pyarrow
+        try:
+            import pyarrow as pa  # type: ignore
+            import pyarrow.parquet as pq  # type: ignore
+        except Exception as e:
+            raise RuntimeError("Parquet generation requires pyarrow to be installed") from e
+
+        rng = random.Random(args.seed)
+        for i in range(args.files):
+            lines = [gen_line(rng, args.words_per_line) for _ in range(args.lines)]
+            table = pa.table({"line": pa.array(lines, type=pa.string())})
+            pq.write_table(table, out / f"data_{i:05}.parquet")
 
 
 if __name__ == "__main__":

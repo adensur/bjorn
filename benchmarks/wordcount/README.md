@@ -14,12 +14,21 @@ This folder contains scripts to generate data, run the naive baseline, run the B
 Runs data generation (optional), naive baseline, single-node Bjorn, and Slurm multi-node Bjorn (by default), then validates outputs and prints timings.
 
 ```bash
-# From repo root
+# From repo root (text format)
 python3 benchmarks/wordcount/benchmark.py \
   --generate \
   --files 20 \
   --lines 20000 \
-  --words-per-line 50
+  --words-per-line 50 \
+  --format text
+
+# Parquet format (input and outputs as Parquet)
+python3 benchmarks/wordcount/benchmark.py \
+  --generate \
+  --files 20 \
+  --lines 20000 \
+  --words-per-line 50 \
+  --format parquet
 ```
 Options:
 - `--generate`: generate synthetic data under `benchmarks/wordcount/data`
@@ -43,16 +52,16 @@ python3 benchmarks/wordcount/data_gen.py \
   --words-per-line 50
 ```
 
-#### 2) Naive baseline
+#### 2) Naive baseline (text or parquet)
 ```bash
-./naive_examples/wordcount/target/release/naive-wordcount \
+./target/release/naive-wordcount-text \
   --input benchmarks/wordcount/data \
   --output benchmarks/wordcount/out_naive
 ```
 
-#### 3) Bjorn single-node (no Slurm)
+#### 3) Bjorn single-node (no Slurm) - text
 ```bash
-./examples/wordcount/target/release/bjorn-wordcount \
+./target/release/bjorn-wordcount-text \
   --input benchmarks/wordcount/data \
   --output benchmarks/wordcount/out_single
 ```

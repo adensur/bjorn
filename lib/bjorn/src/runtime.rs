@@ -1,6 +1,7 @@
 use crate::api::{ExecutablePipeline, Mapper, Reducer};
-use crate::io::{ensure_dir, hash_to_partition, open_writer, read_bin_line,
-    LocalFsSource, TextLineFormat, S3Source, Split, Source, Format, list_splits_for_uri};
+use crate::io::{ensure_dir, hash_to_partition, read_bin_line,
+    LocalFsSource, S3Source, Split, Source, Format, list_splits_for_uri, Sink};
+use crate::io::PartitionWriter;
 use crate::sort::external_sort_by_key;
 use crate::stats::StatsCollector;
 use crate::slurm::SlurmEnv;
@@ -8,7 +9,6 @@ use crate::utils::{detect_env_or_local, env_var_truthy};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs;
-use std::io::Write;
 use memmap2::Mmap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -38,10 +38,12 @@ impl ExecutablePipeline for RuntimePipeline {
 
     fn add_output(&mut self, output_path: impl Into<String>) { self.output = Some(output_path.into()); }
 
-    fn map_reduce<M, R>(&mut self, mapper: M, reducer: R) -> Result<()>
+    fn map_reduce<M, R, Fmt, S>(&mut self, mapper: M, reducer: R, format: Fmt, sink: S) -> Result<()>
     where
-        M: Mapper<Input = String> + Send + Sync + 'static,
+        M: Mapper + Send + Sync + 'static,
         R: Reducer<Key = M::Key, ValueIn = M::Value> + Send + Sync + 'static,
+        Fmt: Format<M::Input> + Send + Sync + 'static,
+        S: Sink<R::Out> + Send + Sync + 'static,
     {
         // Initialize logging once (in case the consumer binary didn't)
         // Default to info; respect RUST_LOG; gate AWS SDK logs to rank0 & debug.
@@ -148,7 +150,15 @@ impl ExecutablePipeline for RuntimePipeline {
         let map_phase_start = Instant::now();
         // Assign map task ids to this process: round-robin by task id across all processes
         let my_task_ids: Vec<usize> = (0..global_ntasks).filter(|i| i % slurm.ntasks == slurm.node_id).collect();
-        let map_stats_vec = run_map_phase(mapper.clone(), &my_task_ids, &chunks, num_reducers, writer_pool.clone(), &launch_root);
+        let map_stats_vec = run_map_phase::<M, Fmt>(
+            mapper.clone(),
+            &my_task_ids,
+            &chunks,
+            num_reducers,
+            writer_pool.clone(),
+            &launch_root,
+            &format,
+        );
 
         // Wait for all logical map tasks to finish
         let t0 = Instant::now();
@@ -220,7 +230,14 @@ impl ExecutablePipeline for RuntimePipeline {
         // ========== Reduce phase (inner, env-agnostic) ==========
         let reduce_phase_start = Instant::now();
         let my_reducers: Vec<usize> = (0..num_reducers).filter(|r| r % slurm.ntasks == slurm.node_id).collect();
-        let reduce_stats_vec = run_reduce_phase(Arc::new(reducer), &my_reducers, &sort_out_dir, &output_dir, &launch_root, Some(slurm.node_id));
+        let reduce_stats_vec = run_reduce_phase::<R, S>(
+            Arc::new(reducer),
+            &my_reducers,
+            &sort_out_dir,
+            &sink,
+            &launch_root,
+            Some(slurm.node_id),
+        );
         // Only rank 0 performs cleanup after all are done
         if slurm.node_id == 0 {
             let t2 = Instant::now();
@@ -328,14 +345,19 @@ struct ReduceStats {
     wall_ms: u64,
 }
 
-fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
+fn run_map_phase<M, Fmt>(
     mapper: Arc<M>,
     my_task_ids: &[usize],
     chunks: &Vec<Vec<Split>>,
     num_reducers: usize,
     writer_pool: Arc<WriterPool>,
     launch_root: &str,
-) -> Vec<MapTaskStats> {
+    format: &Fmt,
+) -> Vec<MapTaskStats>
+where
+    M: Mapper + Send + Sync + 'static,
+    Fmt: Format<M::Input> + Send + Sync + 'static,
+{
     let map_stats: Arc<Mutex<Vec<MapTaskStats>>> = Arc::new(Mutex::new(Vec::new()));
     let run_map_for = |task_id: usize| {
         let task_start = Instant::now();
@@ -347,17 +369,17 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
         let mut total_emits: u64 = 0;
         let mut total_emit_time = Duration::from_nanos(0);
 
-        let text_format = TextLineFormat;
+        // Use provided input format to decode records
         // Re-introduce small thread-local aggregation to reduce per-emit channel sends
         let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
         let mut tw = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
-        let _process_one_file = |split: &Split| {
+        let _process_one_file = |split: &Split, format: &Fmt| {
             let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
                 match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
             } else {
                 match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
             };
-            let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
+            let rec_iter = match format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
             let mut emit = |k: M::Key, v: M::Value| {
                 let emit_start = Instant::now();
                 let part = hash_to_partition(&k, num_reducers);
@@ -375,10 +397,11 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
                 total_emits += 1;
                 total_emit_time += emit_start.elapsed();
             };
-            mapper.do_map(lines_iter, &mut emit);
+            mapper.do_map(rec_iter, &mut emit);
             tw.flush_all();
         };
 
+        let format_ref = format;
         splits.par_iter().for_each(|split| {
             // Create a fresh ThreadWriter per parallel split to avoid sharing &mut across threads
             let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
@@ -386,7 +409,7 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
             } else {
                 match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
             };
-            let lines_iter = match text_format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
+            let rec_iter = match format_ref.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
             let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
             let mut tw_local = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
             let mut emit = |k: M::Key, v: M::Value| {
@@ -401,7 +424,7 @@ fn run_map_phase<M: Mapper<Input = String> + Send + Sync + 'static>(
                 record.extend_from_slice(&val_bytes);
                 tw_local.emit_record(part, &record);
             };
-            mapper.do_map(lines_iter, &mut emit);
+            mapper.do_map(rec_iter, &mut emit);
             tw_local.flush_all();
         });
 
@@ -461,16 +484,20 @@ fn run_sort_phase(my_reducers: &[usize], map_out_dir: &str, sort_out_dir: &str, 
     out
 }
 
-fn run_reduce_phase<R: Reducer + Send + Sync + 'static>(
+fn run_reduce_phase<R, SInk>(
     reducer: Arc<R>,
     my_reducers: &[usize],
     sort_out_dir: &str,
-    output_dir: &str,
+    sink: &SInk,
     launch_root: &str,
     mark_done_index: Option<usize>,
-) -> Vec<ReduceStats> {
+) -> Vec<ReduceStats>
+where
+    R: Reducer + Send + Sync + 'static,
+    SInk: Sink<R::Out> + Send + Sync + 'static,
+{
     let reduce_stats: Arc<Mutex<Vec<ReduceStats>>> = Arc::new(Mutex::new(Vec::new()));
-    let run_reduce_for = |r: usize| {
+    let run_reduce_for = |r: usize, sink: &SInk| {
         let reducer_start = Instant::now();
         let in_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
         let io_read_start = Instant::now();
@@ -482,18 +509,20 @@ fn run_reduce_phase<R: Reducer + Send + Sync + 'static>(
         let mut current_key: Option<R::Key> = None;
         let mut buffer: Vec<R::ValueIn> = Vec::new();
 
-        let mut out_writer = match open_writer(format!("{}/part-{:05}.tsv", output_dir, r)) { Ok(w) => w, Err(e) => { error!("open_writer output: {}", e); return; } };
+        // Open sink partition writer for this reducer
+        let sink_writer_res = sink.open_partition(r);
+        let mut out_writer = match sink_writer_res { Ok(w) => w, Err(e) => { error!("open sink partition {}: {}", r, e); return; } };
 
         let mut parse_time = Duration::from_nanos(0);
         let mut reduce_time = Duration::from_nanos(0);
         let mut write_time = Duration::from_nanos(0);
         let mut groups: u64 = 0;
 
-        let mut flush_group = |key: &R::Key, vals: &Vec<R::ValueIn>, reducer: &R, out_writer: &mut std::io::BufWriter<std::fs::File>| {
+        let mut flush_group = |key: &R::Key, vals: &Vec<R::ValueIn>, reducer: &R, out_writer: &mut <SInk as Sink<R::Out>>::Writer| {
             let reduce_start = Instant::now();
-            let mut emit = |line: String| {
+            let mut emit = |out: R::Out| {
                 let w_start = Instant::now();
-                let _ = writeln!(out_writer, "{}", line);
+                if let Err(e) = out_writer.write(&out) { error!("sink write error: {}", e); }
                 write_time += w_start.elapsed();
             };
             reducer.do_reduce(key, vals.clone().into_iter(), &mut emit);
@@ -536,7 +565,7 @@ fn run_reduce_phase<R: Reducer + Send + Sync + 'static>(
         });
     };
 
-    my_reducers.into_par_iter().for_each(|r| run_reduce_for(*r));
+    my_reducers.into_par_iter().for_each(|r| run_reduce_for(*r, &sink));
     if let Some(idx) = mark_done_index {
         let barrier_path = format!("{}/barrier_reduce_done_{}", launch_root, idx);
         let _ = fs::write(&barrier_path, b"ok");

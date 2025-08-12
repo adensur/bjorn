@@ -1,5 +1,5 @@
 [package]
-name = "bjorn-wordcount"
+name = "bjorn-wordcount-text"
 version = "0.1.0"
 edition = "2021"
 

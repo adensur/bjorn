@@ -1,6 +1,7 @@
 use anyhow::Result;
 use bjorn::{Mapper, Reducer, RuntimePipeline};
 use bjorn::api::ExecutablePipeline;
+use bjorn::io::{TextLineFormat, TextLineSink};
 use clap::Parser;
 use regex::Regex;
 
@@ -41,11 +42,12 @@ struct WordcountReducer;
 impl Reducer for WordcountReducer {
     type Key = String;
     type ValueIn = u64;
+    type Out = String;
 
     fn do_reduce<I, F>(&self, key: &Self::Key, values: I, emit: &mut F)
     where
         I: IntoIterator<Item = Self::ValueIn>,
-        F: FnMut(String),
+        F: FnMut(Self::Out),
     {
         let sum: u64 = values.into_iter().sum();
         emit(format!("\"{}\"\t{}", key, sum));
@@ -57,6 +59,6 @@ fn main() -> Result<()> {
     let mut pipeline = RuntimePipeline::new();
     pipeline.add_input::<String>(&args.input);
     pipeline.add_output(&args.output);
-    pipeline.map_reduce(WordcountMapper, WordcountReducer)?;
+    pipeline.map_reduce(WordcountMapper, WordcountReducer, TextLineFormat, TextLineSink { base: args.output.clone() })?;
     Ok(())
 }

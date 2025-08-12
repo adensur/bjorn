@@ -1,5 +1,5 @@
 [package]
-name = "naive-wordcount-text"
+name = "naive-wordcount-parquet"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,3 +11,4 @@ regex = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+parquet = { version = "51", default-features = true }

@@ -83,6 +83,7 @@ def main():
     ap.add_argument('--lines', type=int, default=20000)
     ap.add_argument('--words-per-line', type=int, default=50)
     ap.add_argument('--input', default=str(BENCH_ROOT / 'data'))
+    ap.add_argument('--format', choices=['text', 'parquet'], default='text')
     args = ap.parse_args()
 
     input_arg = args.input
@@ -117,6 +118,7 @@ def main():
                 '--files', str(args.files),
                 '--lines', str(args.lines),
                 '--words-per-line', str(args.words_per_line),
+                '--format', args.format,
             ]
             t = run(gen_args)
             print(f"Generated data locally in {t:.2f}s; syncing to S3 {s3_uri}...")
@@ -137,6 +139,7 @@ def main():
                 '--files', str(args.files),
                 '--lines', str(args.lines),
                 '--words-per-line', str(args.words_per_line),
+                '--format', args.format,
             ]
             t = run(gen_args)
             print(f"Generated data in {t:.2f}s")
@@ -145,8 +148,14 @@ def main():
 
     # Assume binaries are pre-built
     # Binaries are built into the workspace root target directory
-    naive_bin = REPO / 'target' / 'release' / 'naive-wordcount'
-    bjorn_bin = REPO / 'target' / 'release' / 'bjorn-wordcount'
+    if args.format == 'text':
+        naive_bin = REPO / 'target' / 'release' / 'naive-wordcount-text'
+        bjorn_bin = REPO / 'target' / 'release' / 'bjorn-wordcount-text'
+        validate = BENCH_ROOT / 'validate_outputs_text.py'
+    else:
+        naive_bin = REPO / 'target' / 'release' / 'naive-wordcount-parquet'
+        bjorn_bin = REPO / 'target' / 'release' / 'bjorn-wordcount-parquet'
+        validate = BENCH_ROOT / 'validate_outputs_parquet.py'
 
     # Naive
     t_naive = run([str(naive_bin), '--input', str(naive_input_dir), '--output', str(out_naive)])
@@ -168,7 +177,7 @@ def main():
         t_multi = run(['sbatch', '--wait', str(submit)], env=env)
 
     # Validate
-    val = ['python3', str(BENCH_ROOT / 'validate_outputs.py')]
+    val = ['python3', str(validate)]
     print("Validating naive vs single-node...")
     subprocess.check_call(val + [str(out_naive), str(out_single)])
     if not args.skip_multi:

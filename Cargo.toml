@@ -2,7 +2,9 @@
 members = [
   "lib/bjorn",
   "examples/wordcount",
+  "examples/wordcount_parquet",
   "naive_examples/wordcount",
+  "naive_examples/wordcount_parquet",
   "concepts/fs_sort",
 ]
 resolver = "2"

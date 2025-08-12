@@ -1,13 +1,12 @@
 [package]
-name = "naive-wordcount-text"
+name = "bjorn-wordcount-parquet"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bjorn = { path = "../../lib/bjorn" }
 anyhow = { workspace = true }
-rayon = { workspace = true }
-walkdir = { workspace = true }
-regex = { workspace = true }
 clap = { workspace = true }
+regex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

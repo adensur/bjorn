@@ -51,9 +51,9 @@ fn main() -> Result<()> {
         }
     }
 
-    // write TSV parts sequentially
+    // write text lines sequentially
     fs::create_dir_all(&args.output)?;
-    let out_path = format!("{}/part-00000.tsv", args.output);
+    let out_path = format!("{}/part-00000.txt", args.output);
     let mut lines: Vec<String> = global.into_iter().map(|(k, v)| format!("\"{}\"\t{}", k, v)).collect();
     lines.sort();
     fs::write(out_path, lines.join("\n") + "\n")?;

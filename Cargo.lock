@@ -731,6 +731,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bjorn-join-multistage-text"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bjorn",
+ "clap",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "bjorn-join-text"
 version = "0.1.0"
 dependencies = [
@@ -1939,6 +1954,22 @@ dependencies = [
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "naive-join-multistage-text"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

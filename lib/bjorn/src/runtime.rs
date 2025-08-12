@@ -25,6 +25,7 @@ use std::fs;
 use memmap2::Mmap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, info, debug};
 use tracing_subscriber::{self, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer as _};
 use crate::writer::WriterPool;
@@ -109,7 +110,16 @@ where
                 .or_else(|| std::env::var("SLURM_CPUS_PER_TASK").ok().and_then(|v| v.parse::<usize>().ok()));
             if let Some(n) = n { if n > 0 { std::env::set_var("RAYON_NUM_THREADS", n.to_string()); } }
         }
-        let launch_root = format!(".bjorn_runs/{}", slurm.job_id);
+        // Derive a unique, stage-scoped launch root shared by all tasks in the job/step.
+        // Using a per-process PID would break cross-task barriers, so we use a stage counter.
+        static STAGE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let stage_idx = STAGE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let step_id = std::env::var("SLURM_STEP_ID").ok();
+        let uniq = match step_id {
+            Some(s) => format!("{}-step{}-stage{}", slurm.job_id, s, stage_idx),
+            None => format!("{}-stage{}", slurm.job_id, stage_idx),
+        };
+        let launch_root = format!(".bjorn_runs/{}", uniq);
         ensure_dir(&launch_root)?;
         let map_out_dir = format!("{}/map_out", launch_root);
         let sort_out_dir = format!("{}/sort_out", launch_root);
@@ -117,7 +127,7 @@ where
         ensure_dir(&sort_out_dir)?;
 
         // Prepare output directory (clean it before starting).
-        // Rank 0 clears and signals; others wait for the signal. Works for both Slurm and local (node_id==0).
+        // Rank 0 clears and signals; others wait for the signal. Namespace by reducer count to reduce cross-job collisions.
         if slurm.node_id == 0 {
             let _ = fs::remove_dir_all(&output_dir);
             ensure_dir(&output_dir)?;

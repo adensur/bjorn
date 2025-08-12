@@ -139,8 +139,20 @@ impl Source for LocalFsSource {
 pub struct TextLineFormat;
 impl Format<String> for TextLineFormat {
     fn decode<'a>(&self, r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = String> + Send + 'a>> {
-        let reader = BufReader::new(r);
-        Ok(Box::new(reader.lines().filter_map(|l| l.ok())))
+        // Read entire reader and require valid UTF-8 to avoid tokenizing binary files
+        let mut buf = Vec::new();
+        let mut rd = BufReader::new(r);
+        std::io::Read::read_to_end(&mut rd, &mut buf)?;
+        match String::from_utf8(buf) {
+            Ok(s) => {
+                let lines: Vec<String> = s.lines().map(|l| l.to_owned()).collect();
+                Ok(Box::new(lines.into_iter()))
+            }
+            Err(_) => {
+                // Non-UTF8: treat as empty iterator
+                Ok(Box::new(std::iter::empty::<String>()))
+            }
+        }
     }
 }
 
@@ -444,6 +456,16 @@ impl Source for S3Source {
             Ok::<_, anyhow::Error>(bytes)
         })?;
         Ok(Box::new(std::io::Cursor::new(data)))
+    }
+}
+
+/// Open a reader for a given `Split`'s URI by delegating to the appropriate source implementation.
+pub fn open_reader_for_split(split: &Split) -> Result<Box<dyn Read + Send>> {
+    if split.uri.starts_with("s3://") {
+        let src = S3Source::from_uri(&split.uri)?;
+        src.open_split(split)
+    } else {
+        LocalFsSource.open_split(split)
     }
 }
 

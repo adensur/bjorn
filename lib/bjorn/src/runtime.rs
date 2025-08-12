@@ -1,6 +1,6 @@
 use crate::api::{ExecutablePipeline, Mapper, Reducer};
 use crate::io::{ensure_dir, hash_to_partition, read_bin_line,
-    LocalFsSource, S3Source, Split, Source, Format, list_splits_for_uri, Sink};
+    Split, Format, list_splits_for_uri, Sink, open_reader_for_split};
 use crate::io::PartitionWriter;
 use crate::sort::external_sort_by_key;
 use crate::stats::StatsCollector;
@@ -374,11 +374,7 @@ where
         let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
         let mut tw = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
         let _process_one_file = |split: &Split, format: &Fmt| {
-            let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
-                match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-            } else {
-                match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-            };
+            let reader: Box<dyn std::io::Read + Send> = match open_reader_for_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } };
             let rec_iter = match format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
             let mut emit = |k: M::Key, v: M::Value| {
                 let emit_start = Instant::now();
@@ -404,11 +400,7 @@ where
         let format_ref = format;
         splits.par_iter().for_each(|split| {
             // Create a fresh ThreadWriter per parallel split to avoid sharing &mut across threads
-            let reader: Box<dyn std::io::Read + Send> = if split.uri.starts_with("s3://") {
-                match S3Source::from_uri(&split.uri).and_then(|s| s.open_split(split)) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-            } else {
-                match LocalFsSource.open_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } }
-            };
+            let reader: Box<dyn std::io::Read + Send> = match open_reader_for_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } };
             let rec_iter = match format_ref.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
             let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
             let mut tw_local = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);

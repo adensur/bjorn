@@ -34,6 +34,35 @@ def _parse_s3_uri(uri: str):
     return bucket, prefix
 
 
+def clear_dir(p: Path):
+    if p.exists():
+        shutil.rmtree(p)
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def clear_s3_prefix(s3_uri: str):
+    bucket, prefix = _parse_s3_uri(s3_uri)
+    if _aws_cli_available():
+        # Safe: only delete under provided prefix
+        run(["aws", "s3", "rm", s3_uri, "--recursive", "--only-show-errors"]) 
+        return
+    try:
+        import boto3  # type: ignore
+    except Exception as e:
+        raise RuntimeError("S3 cleanup requires AWS CLI or boto3 to be installed") from e
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    to_delete = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            to_delete.append({"Key": obj["Key"]})
+            if len(to_delete) >= 1000:
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+                to_delete = []
+    if to_delete:
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+
+
 def sync_dir_to_s3(local_dir: Path, s3_uri: str):
     local_dir = Path(local_dir)
     if _aws_cli_available():
@@ -94,10 +123,11 @@ def main():
     out_single = BENCH_ROOT / 'out_single'
     out_multi = BENCH_ROOT / 'out_multi'
 
+    # Ensure a clean run: remove outputs and previous intermediates
     for p in [out_naive, out_single, out_multi]:
-        if p.exists():
-            shutil.rmtree(p)
-        p.mkdir(parents=True, exist_ok=True)
+        clear_dir(p)
+    # Clear previous intermediates to avoid reading stale map/sort artifacts
+    clear_dir(REPO / '.bjorn_runs')
 
     # Determine input locations for each stage
     naive_input_dir: Path
@@ -112,6 +142,8 @@ def main():
         local_gen_dir.mkdir(parents=True, exist_ok=True)
 
         if args.generate:
+            # Clean S3 prefix before generating/uploading to avoid intermixing datasets
+            clear_s3_prefix(s3_uri)
             gen_args = [
                 'python3', str(BENCH_ROOT / 'data_gen.py'),
                 '--out', str(local_gen_dir),
@@ -133,6 +165,8 @@ def main():
     else:
         data_dir = Path(input_arg)
         if args.generate:
+            # Clean local input directory before generation
+            clear_dir(data_dir)
             gen_args = [
                 'python3', str(BENCH_ROOT / 'data_gen.py'),
                 '--out', str(data_dir),

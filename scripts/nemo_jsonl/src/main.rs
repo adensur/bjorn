@@ -11,6 +11,9 @@ struct Args {
     /// Input parquet dir (s3:// or local path) with columns: qid, query, country, body_full, position
     #[arg(long)]
     input: String,
+    /// Optional parquet dir with external docs (page_uuid -> body_full)
+    #[arg(long)]
+    doc_input: Option<String>,
     /// Output directory for JSONL
     #[arg(long)]
     output: String,
@@ -132,16 +135,110 @@ fn main() -> Result<()> {
         });
     }
 
-    // Build pipeline with single Parquet input
-    let mut p: RuntimePipeline<ParquetRow> = RuntimePipeline::new();
-    p.add_input_single::<ParquetRow, _>(&args.input, ParquetFormat);
+    if let Some(doc_uri) = &args.doc_input {
+        // Two-stage: join body_full externally by page_uuid, then group by qid
+        // Stage 1 types and pipeline
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        enum JoinIn { Main { page_uuid: String, qid: String, q: String, country: String, position: i32 }, Doc { page_uuid: String, body_full: String } }
 
-    p.add_output(&args.output);
+        struct JoinMapper;
+        impl Mapper for JoinMapper {
+            type Input = JoinIn;
+            type Key = String; // page_uuid
+            type Value = JoinIn;
+            fn do_map<I, F>(&self, input: I, emit: &mut F)
+            where I: IntoIterator<Item = Self::Input>, F: FnMut(Self::Key, Self::Value) {
+                for rec in input {
+                    match &rec {
+                        JoinIn::Main { page_uuid, .. } => emit(page_uuid.clone(), rec.clone()),
+                        JoinIn::Doc { page_uuid, .. } => emit(page_uuid.clone(), rec.clone()),
+                    }
+                }
+            }
+        }
 
-    let reducer = NemoReducer { min_pos: args.min_positive_position, max_pos: args.max_positive_position, num_negs: args.num_negatives };
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        struct DocStage1 { qid: String, position: i32, body_full: String, query: String, country: String }
 
-    p.map_reduce(NemoMapper, reducer, TextLineSink { base: args.output.clone() })
-        .with_context(|| "map_reduce failed")?;
+        struct JoinReducer;
+        impl Reducer for JoinReducer {
+            type Key = String; // page_uuid
+            type ValueIn = JoinIn;
+            type Out = String; // JSON lines of DocStage1
+            fn do_reduce<I, F>(&self, _key: &Self::Key, values: I, emit: &mut F)
+            where I: IntoIterator<Item = Self::ValueIn>, F: FnMut(Self::Out) {
+                let mut body: Option<String> = None;
+                let mut mains: Vec<(String, i32, String, String)> = Vec::new(); // (qid, position, qtext, country)
+                for v in values {
+                    match v {
+                        JoinIn::Doc { page_uuid: _pu, body_full } => { if body.is_none() { body = Some(body_full); } },
+                        JoinIn::Main { page_uuid: _pu, qid, q, country, position } => {
+                            mains.push((qid, position, q, country));
+                        }
+                    }
+                }
+                if let Some(b) = body {
+                    for (qid, position, q, country) in mains.into_iter() {
+                        let out = DocStage1 { qid, position, body_full: b.clone(), query: q, country };
+                        if let Ok(s) = serde_json::to_string(&out) { emit(s); }
+                    }
+                }
+            }
+        }
 
-    Ok(())
+        // Stage 1 pipeline
+        let stage1_out = format!("{}__stage1", args.output);
+        let mut p1: RuntimePipeline<JoinIn> = RuntimePipeline::new();
+        // Main input mapping
+        p1.add_input::<ParquetRow, _>(&args.input, ParquetFormat, |row| {
+            let page_uuid = pq_req_string(&row, "page_uuid");
+            let qid = pq_req_string(&row, "qid");
+            let q = pq_req_string(&row, "q");
+            let position = pq_req_int(&row, "position");
+            let Some(country) = pq_get_string(&row, "country") else { return JoinIn::Main { page_uuid, qid, q, country: String::new(), position }; };
+            JoinIn::Main { page_uuid, qid, q, country, position }
+        });
+        // Doc input mapping
+        p1.add_input::<ParquetRow, _>(doc_uri, ParquetFormat, |row| {
+            let page_uuid = pq_req_string(&row, "page_uuid");
+            let body_full = pq_req_string(&row, "body_full");
+            JoinIn::Doc { page_uuid, body_full }
+        });
+        p1.add_output(&stage1_out);
+        p1.map_reduce(JoinMapper, JoinReducer, TextLineSink { base: stage1_out.clone() })?;
+
+        // Stage 2: map JSON lines -> (qid -> DocVal), then group & sample via NemoReducer
+        #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+        struct DocStage1In { qid: String, position: i32, body_full: String, query: String, country: String }
+        struct Stage2Mapper;
+        impl Mapper for Stage2Mapper {
+            type Input = String;
+            type Key = String; // qid
+            type Value = DocVal;
+            fn do_map<I, F>(&self, input: I, emit: &mut F)
+            where I: IntoIterator<Item = Self::Input>, F: FnMut(Self::Key, Self::Value) {
+                for line in input {
+                    if let Ok(d) = serde_json::from_str::<DocStage1In>(&line) {
+                        let val = DocVal { position: d.position, body_full: d.body_full, query: d.query, country: d.country };
+                        emit(d.qid, val);
+                    }
+                }
+            }
+        }
+        let mut p2: RuntimePipeline<String> = RuntimePipeline::new();
+        p2.add_input_single::<String, _>(&stage1_out, bjorn::io::TextLineFormat);
+        p2.add_output(&args.output);
+        let reducer = NemoReducer { min_pos: args.min_positive_position, max_pos: args.max_positive_position, num_negs: args.num_negatives };
+        p2.map_reduce(Stage2Mapper, reducer, TextLineSink { base: args.output.clone() })?;
+        Ok(())
+    } else {
+        // Single-stage pipeline (body_full is in the input)
+        let mut p: RuntimePipeline<ParquetRow> = RuntimePipeline::new();
+        p.add_input_single::<ParquetRow, _>(&args.input, ParquetFormat);
+        p.add_output(&args.output);
+        let reducer = NemoReducer { min_pos: args.min_positive_position, max_pos: args.max_positive_position, num_negs: args.num_negatives };
+        p.map_reduce(NemoMapper, reducer, TextLineSink { base: args.output.clone() })
+            .with_context(|| "map_reduce failed")?;
+        Ok(())
+    }
 }

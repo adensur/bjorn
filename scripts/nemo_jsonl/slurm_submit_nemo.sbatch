@@ -13,6 +13,7 @@ set -euo pipefail
 # Supported:
 #   --input <uri>   (required)
 #   --output <dir>  (required)
+#   --doc-input <uri>              (optional)
 #   --max-positive-position <int>  (default 3)
 #   --min-positive-position <int>  (default 4)
 #   --num-negatives <int>          (default 4)
@@ -22,6 +23,7 @@ set -euo pipefail
 BIN="$(pwd)/target/release/nemo-jsonl"
 INPUT=""
 OUTPUT=""
+DOC_INPUT=""
 MAX_POS=3
 MIN_POS=4
 NUM_NEGS=4
@@ -38,6 +40,8 @@ while [[ $# -gt 0 ]]; do
       MIN_POS=${2:?}; shift 2;;
     --num-negatives)
       NUM_NEGS=${2:?}; shift 2;;
+    --doc-input)
+      DOC_INPUT=${2:?}; shift 2;;
     --bin)
       BIN=${2:?}; shift 2;;
     --)
@@ -58,6 +62,7 @@ echo "Running with:"
 echo "  BIN=$BIN"
 echo "  INPUT=$INPUT"
 echo "  OUTPUT=$OUTPUT"
+if [[ -n "$DOC_INPUT" ]]; then echo "  DOC_INPUT=$DOC_INPUT"; fi
 echo "  MAX_POS=$MAX_POS  MIN_POS=$MIN_POS  NUM_NEGS=$NUM_NEGS"
 echo "  SLURM_NTASKS=$SLURM_NTASKS  SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK"
 
@@ -65,6 +70,7 @@ srun --ntasks=$SLURM_NTASKS --cpus-per-task=$SLURM_CPUS_PER_TASK \
   "$BIN" \
   --input "$INPUT" \
   --output "$OUTPUT" \
+  ${DOC_INPUT:+--doc-input "$DOC_INPUT"} \
   --max-positive-position "$MAX_POS" \
   --min-positive-position "$MIN_POS" \
   --num-negatives "$NUM_NEGS"

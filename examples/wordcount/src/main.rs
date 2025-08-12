@@ -53,7 +53,6 @@ impl Reducer for WordcountReducer {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
     let args = Args::parse();
     let mut pipeline = RuntimePipeline::new();
     pipeline.add_input::<String>(&args.input);

@@ -3,7 +3,7 @@
 #SBATCH --output=bjorn_wcount_%j.out
 #SBATCH --error=bjorn_wcount_%j.err
 #SBATCH --ntasks=4
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=96
 #SBATCH --mem=0
 
 set -euo pipefail

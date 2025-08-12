@@ -26,6 +26,6 @@ crossbeam-channel = "0.5"
 memmap2 = "0.9"
 memchr = "2.7"
 bincode = "1.3"
-aws-config = { version = "1", default-features = false, features = ["rustls"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls"] }
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

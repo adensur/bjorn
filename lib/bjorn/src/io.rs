@@ -145,6 +145,18 @@ impl Sink for LocalFsSink {
     }
 }
 
+/// List splits for a given input URI by delegating to the appropriate source implementation.
+/// Supports local filesystem paths and `s3://` URIs.
+pub fn list_splits_for_uri(input: &str) -> Result<Vec<Split>> {
+    if input.starts_with("s3://") {
+        let src = S3Source::from_uri(input)?;
+        src.list_splits(input)
+    } else {
+        let src = LocalFsSource;
+        src.list_splits(input)
+    }
+}
+
 // S3 source (read-only): list objects and open via blocking client
 #[derive(Clone)]
 pub struct S3Source { pub bucket: String, pub prefix: String, pub region: String }

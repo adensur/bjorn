@@ -122,6 +122,36 @@ pub trait Sink<Out>: Send + Sync + 'static {
     fn open_partition(&self, partition_index: usize) -> Result<Self::Writer>;
 }
 
+// ============== Adapters for multi-input pipelines ==============
+
+/// Object-safe decoder that produces a unified mapper input type `U`.
+pub trait AnyFormatTo<U>: Send + Sync {
+    fn decode<'a>(&self, r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = U> + Send + 'a>>;
+}
+
+/// Adapter from a concrete `Format<T>` plus a mapping `fn(T)->U` into `AnyFormatTo<U>`.
+pub struct FormatAdapter<T, Fmt, U>
+where
+    T: Send + 'static,
+    Fmt: Format<T> + Send + Sync + 'static,
+    U: Send + 'static,
+{
+    pub fmt: Fmt,
+    pub map: fn(T) -> U,
+}
+
+impl<T, Fmt, U> AnyFormatTo<U> for FormatAdapter<T, Fmt, U>
+where
+    T: Send + 'static,
+    Fmt: Format<T> + Send + Sync + 'static,
+    U: Send + 'static,
+{
+    fn decode<'a>(&self, r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = U> + Send + 'a>> {
+        let it = self.fmt.decode(r)?;
+        Ok(Box::new(it.map(self.map)))
+    }
+}
+
 // Local FS implementations
 pub struct LocalFsSource;
 impl Source for LocalFsSource {

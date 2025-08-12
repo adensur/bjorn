@@ -31,14 +31,31 @@ pub trait Reducer {
 
 // ========== Executable pipeline interface (format- and sink-agnostic) ==========
 
-pub trait ExecutablePipeline {
-    fn add_input<T: Send + 'static>(&mut self, input_path: impl Into<String>);
+/// Executable pipeline over a concrete mapper input type `MInput`.
+/// Supports registering multiple heterogenous inputs by providing per-input decoders and
+/// a mapping function into the mapper's input union type.
+pub trait ExecutablePipeline<MInput> {
+    /// Register an input directory with a specific `Format<T>` implementation and a mapping
+    /// function that converts each decoded `T` into the mapper's input type `MInput`.
+    fn add_input<T, F>(&mut self, input_path: impl Into<String>, format: F, into_union: fn(T) -> MInput)
+    where
+        T: Send + 'static,
+        F: crate::io::Format<T> + Send + Sync + 'static;
+
+    /// Convenience for single-input jobs where `MInput == T` (uses identity mapping).
+    fn add_input_single<T, F>(&mut self, input_path: impl Into<String>, format: F)
+    where
+        T: Send + 'static,
+        F: crate::io::Format<T> + Send + Sync + 'static,
+        MInput: From<T>;
+
+    /// Set output directory
     fn add_output(&mut self, output_path: impl Into<String>);
 
-    fn map_reduce<M, R, Fmt, S>(&mut self, mapper: M, reducer: R, format: Fmt, sink: S) -> Result<()>
+    /// Run MapReduce using the registered inputs and provided sink.
+    fn map_reduce<M, R, S>(&mut self, mapper: M, reducer: R, sink: S) -> Result<()>
     where
-        M: Mapper + Send + Sync + 'static,
+        M: Mapper<Input = MInput> + Send + Sync + 'static,
         R: Reducer<Key = M::Key, ValueIn = M::Value> + Send + Sync + 'static,
-        Fmt: crate::io::Format<M::Input> + Send + Sync + 'static,
         S: crate::io::Sink<R::Out> + Send + Sync + 'static;
 }

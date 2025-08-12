@@ -731,6 +731,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bjorn-join-text"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bjorn",
+ "clap",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "bjorn-wordcount-parquet"
 version = "0.1.0"
 dependencies = [
@@ -1927,6 +1942,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "naive-join-text"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "naive-wordcount-parquet"
 version = "0.1.0"
 dependencies = [
@@ -3006,7 +3037,9 @@ version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f33196643e165781c20a5ead5582283a7dacbb87855d867fbc2df3f81eddc1be"
 dependencies = [
+ "getrandom 0.3.3",
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

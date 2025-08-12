@@ -61,13 +61,13 @@ impl Reducer for WordcountReducer {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut pipeline = RuntimePipeline::new();
-    pipeline.add_input::<ParquetRow>(&args.input);
+    let mut pipeline: RuntimePipeline<ParquetRow> = RuntimePipeline::new();
+    pipeline.add_input_single::<ParquetRow, _>(&args.input, ParquetFormat);
     pipeline.add_output(&args.output);
     let mut schema = std::collections::BTreeMap::new();
     schema.insert("word".to_string(), ParquetFieldType::String);
     schema.insert("count".to_string(), ParquetFieldType::Int64);
     let sink = ParquetRowSink { base: args.output.clone(), schema };
-    pipeline.map_reduce(WordcountMapper, WordcountReducer, ParquetFormat, sink)?;
+    pipeline.map_reduce(WordcountMapper, WordcountReducer, sink)?;
     Ok(())
 }

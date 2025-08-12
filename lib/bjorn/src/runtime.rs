@@ -1,6 +1,6 @@
 use crate::api::{ExecutablePipeline, Mapper, Reducer};
 use crate::io::{ensure_dir, hash_to_partition, read_bin_line,
-    Split, Format, list_splits_for_uri, Sink, open_reader_for_split};
+    Split, list_splits_for_uri, Sink, open_reader_for_split, AnyFormatTo};
 use crate::io::PartitionWriter;
 use crate::sort::external_sort_by_key;
 use crate::stats::StatsCollector;
@@ -32,30 +32,51 @@ use std::time::{Duration, Instant};
 
 // moved to inner section below
 
-pub struct RuntimePipeline {
-    inputs: Vec<String>,
+pub struct RuntimePipeline<MInput> {
+    inputs: Vec<RegisteredInput<MInput>>,
     output: Option<String>,
 }
 
-impl RuntimePipeline {
+struct RegisteredInput<MInput> {
+    path: String,
+    decoder: std::sync::Arc<dyn AnyFormatTo<MInput>>, // type-erased decoder to MInput
+}
+
+impl<MInput> RuntimePipeline<MInput> {
     pub fn new() -> Self { Self { inputs: vec![], output: None } }
 }
 
-impl Default for RuntimePipeline { fn default() -> Self { Self::new() } }
+impl<MInput> Default for RuntimePipeline<MInput> { fn default() -> Self { Self::new() } }
 
-impl ExecutablePipeline for RuntimePipeline {
-    fn add_input<T: Send + 'static>(&mut self, input_path: impl Into<String>) {
-        let _ = std::marker::PhantomData::<T>;
-        self.inputs.push(input_path.into());
+impl<MInput> ExecutablePipeline<MInput> for RuntimePipeline<MInput>
+where
+    MInput: Send + 'static,
+{
+    fn add_input<T, F>(&mut self, input_path: impl Into<String>, format: F, into_union: fn(T) -> MInput)
+    where
+        T: Send + 'static,
+        F: crate::io::Format<T> + Send + Sync + 'static,
+    {
+        let adapter = crate::io::FormatAdapter { fmt: format, map: into_union };
+        let decoder: std::sync::Arc<dyn AnyFormatTo<MInput>> = std::sync::Arc::new(adapter);
+        self.inputs.push(RegisteredInput { path: input_path.into(), decoder });
+    }
+
+    fn add_input_single<T, F>(&mut self, input_path: impl Into<String>, format: F)
+    where
+        T: Send + 'static,
+        F: crate::io::Format<T> + Send + Sync + 'static,
+        MInput: From<T>,
+    {
+        self.add_input::<T, F>(input_path, format, MInput::from);
     }
 
     fn add_output(&mut self, output_path: impl Into<String>) { self.output = Some(output_path.into()); }
 
-    fn map_reduce<M, R, Fmt, S>(&mut self, mapper: M, reducer: R, format: Fmt, sink: S) -> Result<()>
+    fn map_reduce<M, R, S>(&mut self, mapper: M, reducer: R, sink: S) -> Result<()>
     where
-        M: Mapper + Send + Sync + 'static,
+        M: Mapper<Input = MInput> + Send + Sync + 'static,
         R: Reducer<Key = M::Key, ValueIn = M::Value> + Send + Sync + 'static,
-        Fmt: Format<M::Input> + Send + Sync + 'static,
         S: Sink<R::Out> + Send + Sync + 'static,
     {
         // Initialize logging once (in case the consumer binary didn't)
@@ -107,11 +128,11 @@ impl ExecutablePipeline for RuntimePipeline {
             wait_for_barrier(&launch_root, "output_cleared", 1);
         }
 
-        // inputs -> splits (local or s3)
-        let mut all_splits: Vec<Split> = Vec::new();
-        for inp in &self.inputs {
-            let mut splits = list_splits_for_uri(inp)?;
-            all_splits.append(&mut splits);
+        // inputs -> splits (local or s3) with input index tagging
+        let mut all_splits: Vec<(usize, Split)> = Vec::new();
+        for (idx, reg) in self.inputs.iter().enumerate() {
+            let mut splits = list_splits_for_uri(&reg.path)?;
+            for s in splits.drain(..) { all_splits.push((idx, s)); }
         }
 
         // Determine task topology and plan what this process should do
@@ -119,7 +140,7 @@ impl ExecutablePipeline for RuntimePipeline {
         let global_ntasks = global_ntasks_raw.min(all_splits.len().max(1));
 
         // partition files among logical tasks
-        let chunks: Vec<Vec<Split>> = (0..global_ntasks)
+        let chunks: Vec<Vec<(usize, Split)>> = (0..global_ntasks)
             .map(|i| {
                 all_splits
                     .iter()
@@ -163,14 +184,14 @@ impl ExecutablePipeline for RuntimePipeline {
         let map_phase_start = Instant::now();
         // Assign map task ids to this process: round-robin by task id across all processes
         let my_task_ids: Vec<usize> = (0..global_ntasks).filter(|i| i % slurm.ntasks == slurm.node_id).collect();
-        let map_stats_vec = run_map_phase::<M, Fmt>(
+        let map_stats_vec = run_map_phase::<M, MInput>(
             mapper.clone(),
             &my_task_ids,
             &chunks,
             num_reducers,
             writer_pool.clone(),
             &launch_root,
-            &format,
+            &self.inputs.iter().map(|r| r.decoder.clone()).collect(),
         );
 
         // Wait for all logical map tasks to finish (mapper compute complete)
@@ -290,7 +311,7 @@ impl ExecutablePipeline for RuntimePipeline {
     }
 }
 
-pub fn default_pipeline() -> RuntimePipeline { RuntimePipeline::new() }
+pub fn default_pipeline<MInput>() -> RuntimePipeline<MInput> { RuntimePipeline::new() }
 
 fn wait_for_barrier(root: &str, phase: &str, expected: usize) {
     use std::{thread, time::Duration};
@@ -364,18 +385,18 @@ struct ReduceStats {
     wall_ms: u64,
 }
 
-fn run_map_phase<M, Fmt>(
+fn run_map_phase<M, MInput>(
     mapper: Arc<M>,
     my_task_ids: &[usize],
-    chunks: &Vec<Vec<Split>>,
+    chunks: &Vec<Vec<(usize, Split)>>,
     num_reducers: usize,
     writer_pool: Arc<WriterPool>,
     launch_root: &str,
-    format: &Fmt,
+    decoders: &Vec<std::sync::Arc<dyn AnyFormatTo<MInput>>>,
 ) -> Vec<MapTaskStats>
 where
-    M: Mapper + Send + Sync + 'static,
-    Fmt: Format<M::Input> + Send + Sync + 'static,
+    M: Mapper<Input = MInput> + Send + Sync + 'static,
+    MInput: Send + 'static,
 {
     let map_stats: Arc<Mutex<Vec<MapTaskStats>>> = Arc::new(Mutex::new(Vec::new()));
     let run_map_for = |task_id: usize| {
@@ -392,9 +413,10 @@ where
         // Re-introduce small thread-local aggregation to reduce per-emit channel sends
         let local_batch_bytes = std::env::var(ENV_LOCAL_BATCH_BYTES).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_LOCAL_BATCH_BYTES);
         let mut tw = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
-        let _process_one_file = |split: &Split, format: &Fmt| {
+        let _process_one_file = |input_idx: usize, split: &Split| {
             let reader: Box<dyn std::io::Read + Send> = match open_reader_for_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } };
-            let rec_iter = match format.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
+            let decoder = &decoders[input_idx];
+            let rec_iter = match decoder.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
             let mut emit = |k: M::Key, v: M::Value| {
                 let emit_start = Instant::now();
                 let part = hash_to_partition(&k, num_reducers);
@@ -416,11 +438,10 @@ where
             tw.flush_all();
         };
 
-        let format_ref = format;
-        splits.par_iter().for_each(|split| {
+        splits.par_iter().for_each(|(input_idx, split)| {
             // Create a fresh ThreadWriter per parallel split to avoid sharing &mut across threads
             let reader: Box<dyn std::io::Read + Send> = match open_reader_for_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } };
-            let rec_iter = match format_ref.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
+            let rec_iter = match decoders[*input_idx].decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
             let local_batch_bytes = std::env::var(ENV_LOCAL_BATCH_BYTES).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_LOCAL_BATCH_BYTES);
             let mut tw_local = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
             let mut emit = |k: M::Key, v: M::Value| {

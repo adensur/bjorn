@@ -5,6 +5,8 @@ members = [
   "examples/wordcount_parquet",
   "naive_examples/wordcount",
   "naive_examples/wordcount_parquet",
+  "examples/join",
+  "naive_examples/join",
   "concepts/fs_sort",
 ]
 resolver = "2"

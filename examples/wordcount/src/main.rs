@@ -56,9 +56,9 @@ impl Reducer for WordcountReducer {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut pipeline = RuntimePipeline::new();
-    pipeline.add_input::<String>(&args.input);
+    let mut pipeline: RuntimePipeline<String> = RuntimePipeline::new();
+    pipeline.add_input_single::<String, _>(&args.input, TextLineFormat);
     pipeline.add_output(&args.output);
-    pipeline.map_reduce(WordcountMapper, WordcountReducer, TextLineFormat, TextLineSink { base: args.output.clone() })?;
+    pipeline.map_reduce(WordcountMapper, WordcountReducer, TextLineSink { base: args.output.clone() })?;
     Ok(())
 }

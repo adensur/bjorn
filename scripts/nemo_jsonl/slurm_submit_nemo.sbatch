@@ -57,6 +57,7 @@ if [[ -z "$INPUT" || -z "$OUTPUT" ]]; then
 fi
 
 export RUST_LOG=${RUST_LOG:-info}
+export RUST_LOG_FORMAT=${RUST_LOG_FORMAT:-plain}
 
 echo "Running with:"
 echo "  BIN=$BIN"
@@ -66,7 +67,10 @@ if [[ -n "$DOC_INPUT" ]]; then echo "  DOC_INPUT=$DOC_INPUT"; fi
 echo "  MAX_POS=$MAX_POS  MIN_POS=$MIN_POS  NUM_NEGS=$NUM_NEGS"
 echo "  SLURM_NTASKS=$SLURM_NTASKS  SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK"
 
-srun --ntasks=$SLURM_NTASKS --cpus-per-task=$SLURM_CPUS_PER_TASK \
+SINFO=$(scontrol show job $SLURM_JOB_ID 2>/dev/null || true)
+echo "$SINFO"
+
+srun --ntasks=$SLURM_NTASKS --cpus-per-task=$SLURM_CPUS_PER_TASK --mpi=none \
   "$BIN" \
   --input "$INPUT" \
   --output "$OUTPUT" \

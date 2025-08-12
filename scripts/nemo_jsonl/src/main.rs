@@ -127,13 +127,6 @@ fn pq_req_int(row: &ParquetRow, key: &str) -> i32 {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    // Init logging if not already initialized by environment
-    {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).try_init();
-        });
-    }
 
     if let Some(doc_uri) = &args.doc_input {
         // Two-stage: join body_full externally by page_uuid, then group by qid

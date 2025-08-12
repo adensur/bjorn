@@ -323,6 +323,15 @@ where
 
 pub fn default_pipeline<MInput>() -> RuntimePipeline<MInput> { RuntimePipeline::new() }
 
+fn count_barriers(root: &str, phase: &str, expected: usize) -> usize {
+    let mut done = 0usize;
+    for i in 0..expected {
+        let p = format!("{}/barrier_{}_{}", root, phase, i);
+        if Path::new(&p).exists() { done += 1; }
+    }
+    done
+}
+
 fn wait_for_barrier(root: &str, phase: &str, expected: usize) {
     use std::{thread, time::Duration};
     let start = std::time::Instant::now();
@@ -409,7 +418,7 @@ where
     MInput: Send + 'static,
 {
     let map_stats: Arc<Mutex<Vec<MapTaskStats>>> = Arc::new(Mutex::new(Vec::new()));
-    let run_map_for = |task_id: usize| {
+        let run_map_for = |task_id: usize| {
         let task_start = Instant::now();
         let splits = &chunks[task_id];
         debug!(task_id, num_files = splits.len(), writers = num_reducers, "map task starting");
@@ -473,6 +482,10 @@ where
         // touch barrier file
         let barrier_path = format!("{}/barrier_map_done_{}", launch_root, task_id);
         if let Err(e) = fs::write(&barrier_path, b"ok") { error!("barrier write: {}", e); }
+        let expected_tasks = chunks.len();
+        let done_tasks = count_barriers(launch_root, "map_done", expected_tasks);
+        let pct = (done_tasks as f64 / expected_tasks.max(1) as f64) * 100.0;
+        info!(phase = "map", task_id = task_id, done = true, progress = format!("{}/{} ({:.1}%)", done_tasks, expected_tasks, pct), num_files = splits.len(), wall_ms = task_start.elapsed().as_millis() as u64, "map task complete");
 
         // record stats
         let mut guard = map_stats.lock().unwrap();
@@ -506,6 +519,20 @@ fn run_sort_phase(my_reducers: &[usize], map_out_dir: &str, sort_out_dir: &str, 
                 // barrier for sort
                 let barrier_path = format!("{}/barrier_sort_done_{}", launch_root, r);
                 let _ = fs::write(&barrier_path, b"ok");
+                let expected = my_reducers.iter().chain(std::iter::empty()).count().max(1); // total reducers might be larger; use num_reducers
+                let expected_total = {
+                    // We don't have num_reducers in scope directly; infer from highest index + 1 via scan (best-effort)
+                    // Fallback to expected
+                    let mut max_idx = 0usize;
+                    for i in 0..expected*4 { // limit scan
+                        let p = format!("{}/barrier_sort_done_{}", launch_root, i);
+                        if Path::new(&p).exists() { if i > max_idx { max_idx = i; } }
+                    }
+                    (max_idx + 1).max(expected)
+                };
+                let done_cnt = count_barriers(launch_root, "sort_done", expected_total);
+                let pct = (done_cnt as f64 / expected_total.max(1) as f64) * 100.0;
+                info!(phase = "sort", reducer = r, done = true, progress = format!("{}/{} ({:.1}%)", done_cnt, expected_total, pct), lines_in = outcome.lines_in, bytes_in = outcome.bytes_in, wall_ms = reducer_start.elapsed().as_millis() as u64, "sort reducer complete");
                 let mut guard = sort_stats.lock().unwrap();
                 guard.push(SortReducerWall {
                     reducer: r as u64,
@@ -605,6 +632,20 @@ where
             io_read_ms,
             wall_ms: reducer_start.elapsed().as_millis() as u64,
         });
+        // mark per-reducer completion for progress metrics
+        let barrier_part = format!("{}/barrier_reduce_part_done_{}", launch_root, r);
+        let _ = fs::write(&barrier_part, b"ok");
+        // compute progress across all reducers
+        // Try to infer total reducers by scanning sort outputs (reduce_in_partX.tsv)
+        let mut max_idx = 0usize;
+        for i in 0..(my_reducers.len().max(1) * 4) {
+            let p = format!("{}/reduce_in_part{}.tsv", sort_out_dir, i);
+            if Path::new(&p).exists() { if i > max_idx { max_idx = i; } }
+        }
+        let expected_total = (max_idx + 1).max(my_reducers.len().max(1));
+        let done_cnt = count_barriers(launch_root, "reduce_part_done", expected_total);
+        let pct = (done_cnt as f64 / expected_total.max(1) as f64) * 100.0;
+        info!(phase = "reduce", reducer = r, done = true, progress = format!("{}/{} ({:.1}%)", done_cnt, expected_total, pct), lines_in = lines_in, groups = groups, wall_ms = reducer_start.elapsed().as_millis() as u64, "reduce reducer complete");
     };
 
     my_reducers.into_par_iter().for_each(|r| run_reduce_for(*r, &sink));

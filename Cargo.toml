@@ -9,6 +9,7 @@ members = [
   "naive_examples/join",
   "examples/join_multistage",
   "naive_examples/join_multistage",
+  "scripts/nemo_jsonl",
   "concepts/fs_sort",
 ]
 resolver = "2"

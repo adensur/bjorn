@@ -7,19 +7,47 @@ from typing import Optional
 
 from tqdm import tqdm  # assume installed; no fallbacks
 
-WORD_POOL = [
-    "apple", "banana", "carrot", "delta", "echo", "foxtrot",
-    "golf", "hotel", "india", "juliet", "kilo", "lima",
-    "mango", "nectarine", "orange", "papaya", "quartz", "raspberry",
-    "strawberry", "tomato", "ugli", "vanilla", "watermelon", "xigua",
-    "yam", "zucchini"
-]
-
-def gen_line(rng: random.Random, num_words: int) -> str:
-    return " ".join(rng.choice(WORD_POOL) for _ in range(num_words))
+# We intentionally avoid a fixed small word list to prevent reducer skew.
+# Keys are random-looking, reproducible strings derived from an integer id.
+import hashlib
+import base64
 
 
-def write_one_file(idx: int, out_dir: str, num_lines: int, words_per_line: int, seed: Optional[int], buffer_lines: int, show_inner_progress: bool = False):
+def _id_to_key(idx: int, seed: Optional[int], key_len: int) -> str:
+    """Map a key id -> deterministic random-looking string of length key_len.
+
+    Uses base32(sha1(seed:id)) for portability and readability, lowercased and truncated.
+    """
+    s = f"{0 if seed is None else seed}:{idx}".encode()
+    encoded = base64.b32encode(hashlib.sha1(s).digest()).decode("ascii").lower()
+    # base32 gives A-Z2-7; lowercased is [a-z2-7]; truncate to requested length
+    return encoded[:key_len]
+
+
+def gen_line(
+    rng: random.Random,
+    num_words: int,
+    distinct_keys: int,
+    key_len: int,
+    base_seed: Optional[int],
+) -> str:
+    return " ".join(
+        _id_to_key(rng.randrange(distinct_keys), base_seed, key_len)
+        for _ in range(num_words)
+    )
+
+
+def write_one_file(
+    idx: int,
+    out_dir: str,
+    num_lines: int,
+    words_per_line: int,
+    seed: Optional[int],
+    buffer_lines: int,
+    distinct_keys: int,
+    key_len: int,
+    show_inner_progress: bool = False,
+):
     # Each worker uses its own RNG to avoid contention and ensure determinism if seed is set
     rng = random.Random((seed + idx) if seed is not None else None)
     path = Path(out_dir) / f"data_{idx:05}.txt"
@@ -32,7 +60,7 @@ def write_one_file(idx: int, out_dir: str, num_lines: int, words_per_line: int, 
         with open(path, "w") as f:
             buf = []
             for _ in range(num_lines):
-                buf.append(gen_line(rng, words_per_line))
+                buf.append(gen_line(rng, words_per_line, distinct_keys, key_len, seed))
                 if len(buf) >= buffer_lines:
                     f.write("\n".join(buf) + "\n")
                     lines_written += len(buf)
@@ -60,6 +88,8 @@ def main():
     ap.add_argument("--files", type=int, default=10)
     ap.add_argument("--lines", type=int, default=10000)
     ap.add_argument("--words-per-line", type=int, default=50)
+    ap.add_argument("--distinct-keys", type=int, default=10000, help="Number of distinct keys to sample from")
+    ap.add_argument("--key-len", type=int, default=8, help="Length of each random key string")
     ap.add_argument("--jobs", type=int, default=32, help="Number of parallel worker processes")
     ap.add_argument("--format", choices=["text", "parquet"], default="text")
     ap.add_argument("--seed", type=int, default=None, help="Base RNG seed for reproducible data")
@@ -78,7 +108,15 @@ def main():
             outer = tqdm(total=total_lines, desc="generating", unit="lines")
             for i in range(args.files):
                 written = write_one_file(
-                    i, str(out), args.lines, args.words_per_line, args.seed, args.buffer_lines, args.progress_per_file
+                    i,
+                    str(out),
+                    args.lines,
+                    args.words_per_line,
+                    args.seed,
+                    args.buffer_lines,
+                    args.distinct_keys,
+                    args.key_len,
+                    args.progress_per_file,
                 )
                 outer.update(written)
             outer.close()
@@ -89,7 +127,17 @@ def main():
 
     if args.format == "text":
         tasks = [
-            (i, str(out), args.lines, args.words_per_line, args.seed, args.buffer_lines, False)
+            (
+                i,
+                str(out),
+                args.lines,
+                args.words_per_line,
+                args.seed,
+                args.buffer_lines,
+                args.distinct_keys,
+                args.key_len,
+                False,
+            )
             for i in range(args.files)
         ]
 
@@ -110,7 +158,10 @@ def main():
 
         rng = random.Random(args.seed)
         for i in range(args.files):
-            lines = [gen_line(rng, args.words_per_line) for _ in range(args.lines)]
+            lines = [
+                gen_line(rng, args.words_per_line, args.distinct_keys, args.key_len, args.seed)
+                for _ in range(args.lines)
+            ]
             table = pa.table({"line": pa.array(lines, type=pa.string())})
             pq.write_table(table, out / f"data_{i:05}.parquet")
 

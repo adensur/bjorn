@@ -160,14 +160,20 @@ impl ExecutablePipeline for RuntimePipeline {
             &format,
         );
 
-        // Wait for all logical map tasks to finish
+        // Wait for all logical map tasks to finish (mapper compute complete)
         let t0 = Instant::now();
         wait_for_barrier(&launch_root, "map_done", global_ntasks);
         info!(phase = "barrier_map_wait", wait_ms = t0.elapsed().as_millis() as u64, "Barrier wait for map phase completed");
 
-        // Ensure all writers are closed before proceeding
+        // Ensure all writers are closed before proceeding (mapper IO complete)
         writer_pool.close_all();
         writer_joiner.join_all();
+        // Signal this process has fully flushed map outputs, then wait for all peers
+        let flush_mark = format!("{}/barrier_map_flush_done_{}", launch_root, slurm.node_id);
+        let _ = fs::write(&flush_mark, b"ok");
+        let t0b = Instant::now();
+        wait_for_barrier(&launch_root, "map_flush_done", slurm.ntasks.max(1));
+        info!(phase = "barrier_map_flush_wait", wait_ms = t0b.elapsed().as_millis() as u64, "Barrier wait for map flush completed");
 
         let map_phase_ms = map_phase_start.elapsed().as_millis() as u64;
         // aggregate via StatsCollector

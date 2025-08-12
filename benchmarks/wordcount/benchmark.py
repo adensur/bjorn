@@ -111,6 +111,10 @@ def main():
     ap.add_argument('--files', type=int, default=20)
     ap.add_argument('--lines', type=int, default=20000)
     ap.add_argument('--words-per-line', type=int, default=50)
+    ap.add_argument('--distinct-keys', type=int, default=10000,
+                    help='Number of distinct keys to sample from during data generation')
+    ap.add_argument('--key-len', type=int, default=8,
+                    help='Length of each generated random key (base32)')
     ap.add_argument('--input', default=str(BENCH_ROOT / 'data'))
     ap.add_argument('--format', choices=['text', 'parquet'], default='text')
     args = ap.parse_args()
@@ -150,6 +154,8 @@ def main():
                 '--files', str(args.files),
                 '--lines', str(args.lines),
                 '--words-per-line', str(args.words_per_line),
+                '--distinct-keys', str(args.distinct_keys),
+                '--key-len', str(args.key_len),
                 '--format', args.format,
             ]
             t = run(gen_args)
@@ -173,6 +179,8 @@ def main():
                 '--files', str(args.files),
                 '--lines', str(args.lines),
                 '--words-per-line', str(args.words_per_line),
+                '--distinct-keys', str(args.distinct_keys),
+                '--key-len', str(args.key_len),
                 '--format', args.format,
             ]
             t = run(gen_args)

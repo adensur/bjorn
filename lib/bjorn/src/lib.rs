@@ -6,6 +6,7 @@ pub mod sort;
 pub mod stats;
 pub mod writer;
 pub mod utils;
+pub mod constants;
 
 pub use api::{Mapper, Reducer};
 pub use runtime::{default_pipeline, RuntimePipeline};

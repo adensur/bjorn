@@ -419,7 +419,7 @@ impl S3Source {
         // Expect s3://bucket/prefix...
         let rest = uri.strip_prefix("s3://").context("s3 uri must start with s3://")?;
         let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-        Ok(Self { bucket: bucket.to_string(), prefix: prefix.to_string(), region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()) })
+        Ok(Self { bucket: bucket.to_string(), prefix: prefix.to_string(), region: std::env::var(crate::constants::ENV_AWS_REGION).unwrap_or_else(|_| crate::constants::DEFAULT_AWS_REGION.into()) })
     }
 }
 

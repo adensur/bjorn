@@ -1,4 +1,5 @@
 use crate::slurm::SlurmEnv;
+use crate::constants::ENV_LOCAL_TASKS;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn detect_env_or_local() -> SlurmEnv {
@@ -8,7 +9,7 @@ pub fn detect_env_or_local() -> SlurmEnv {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let _local_tasks = std::env::var("BJORN_LOCAL_TASKS")
+        let _local_tasks = std::env::var(ENV_LOCAL_TASKS)
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| num_cpus::get());

@@ -6,6 +6,19 @@ use crate::sort::external_sort_by_key;
 use crate::stats::StatsCollector;
 use crate::slurm::SlurmEnv;
 use crate::utils::{detect_env_or_local, env_var_truthy};
+use crate::constants::{
+    ENV_KEEP_INTERMEDIATES,
+    ENV_RAYON_THREADS,
+    ENV_NUM_REDUCERS,
+    ENV_FLUSH_BYTES,
+    ENV_FLUSH_INTERVAL_MS,
+    ENV_WRITER_QUEUE_CAP,
+    ENV_LOCAL_BATCH_BYTES,
+    DEFAULT_FLUSH_BYTES,
+    DEFAULT_FLUSH_INTERVAL_MS,
+    DEFAULT_WRITER_QUEUE_CAP,
+    DEFAULT_LOCAL_BATCH_BYTES,
+};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs;
@@ -67,11 +80,11 @@ impl ExecutablePipeline for RuntimePipeline {
         // Detect environment and build execution plan
         let slurm = detect_env_or_local();
         let output_dir = self.output.clone().context("output not set")?;
-        let keep_intermediates = env_var_truthy("BJORN_KEEP_INTERMEDIATES");
+        let keep_intermediates = env_var_truthy(ENV_KEEP_INTERMEDIATES);
 
         // Configure Rayon threads based on environment (Slurm cpus-per-task or override)
         if std::env::var("RAYON_NUM_THREADS").is_err() {
-            let n = std::env::var("BJORN_RAYON_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
+            let n = std::env::var(ENV_RAYON_THREADS).ok().and_then(|v| v.parse::<usize>().ok())
                 .or_else(|| std::env::var("SLURM_CPUS_PER_TASK").ok().and_then(|v| v.parse::<usize>().ok()));
             if let Some(n) = n { if n > 0 { std::env::set_var("RAYON_NUM_THREADS", n.to_string()); } }
         }
@@ -124,7 +137,7 @@ impl ExecutablePipeline for RuntimePipeline {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| num_cpus::get());
         let default_reducers = cpus_per_task.max(1);
-        let num_reducers = std::env::var("BJORN_NUM_REDUCERS")
+        let num_reducers = std::env::var(ENV_NUM_REDUCERS)
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(default_reducers)
@@ -139,9 +152,9 @@ impl ExecutablePipeline for RuntimePipeline {
         );
 
         // Writer pool shared within the process
-        let flush_bytes = std::env::var("BJORN_FLUSH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16 * 1024 * 1024);
-        let flush_interval_ms = std::env::var("BJORN_FLUSH_INTERVAL_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(200);
-        let queue_cap = std::env::var("BJORN_WRITER_QUEUE_CAP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
+        let flush_bytes = std::env::var(ENV_FLUSH_BYTES).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_FLUSH_BYTES);
+        let flush_interval_ms = std::env::var(ENV_FLUSH_INTERVAL_MS).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
+        let queue_cap = std::env::var(ENV_WRITER_QUEUE_CAP).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_WRITER_QUEUE_CAP);
         let (pool_inner, pool_joiner) = WriterPool::new(map_out_dir.clone(), slurm.node_id, num_reducers, flush_bytes, Duration::from_millis(flush_interval_ms), queue_cap)?;
         let writer_pool = Arc::new(pool_inner);
         let mut writer_joiner = pool_joiner;
@@ -377,7 +390,7 @@ where
 
         // Use provided input format to decode records
         // Re-introduce small thread-local aggregation to reduce per-emit channel sends
-        let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
+        let local_batch_bytes = std::env::var(ENV_LOCAL_BATCH_BYTES).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_LOCAL_BATCH_BYTES);
         let mut tw = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
         let _process_one_file = |split: &Split, format: &Fmt| {
             let reader: Box<dyn std::io::Read + Send> = match open_reader_for_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } };
@@ -408,7 +421,7 @@ where
             // Create a fresh ThreadWriter per parallel split to avoid sharing &mut across threads
             let reader: Box<dyn std::io::Read + Send> = match open_reader_for_split(split) { Ok(r) => r, Err(e) => { error!("open_split {}: {}", split.uri, e); return; } };
             let rec_iter = match format_ref.decode(reader) { Ok(it) => it, Err(e) => { error!("decode {}: {}", split.uri, e); return; } };
-            let local_batch_bytes = std::env::var("BJORN_LOCAL_BATCH_BYTES").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024);
+            let local_batch_bytes = std::env::var(ENV_LOCAL_BATCH_BYTES).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_LOCAL_BATCH_BYTES);
             let mut tw_local = writer_pool.make_thread_writer(num_reducers, local_batch_bytes);
             let mut emit = |k: M::Key, v: M::Value| {
                 let part = hash_to_partition(&k, num_reducers);

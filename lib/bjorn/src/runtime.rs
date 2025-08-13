@@ -141,8 +141,22 @@ where
         // inputs -> splits (local or s3) with input index tagging
         let mut all_splits: Vec<(usize, Split)> = Vec::new();
         for (idx, reg) in self.inputs.iter().enumerate() {
-            let mut splits = list_splits_for_uri(&reg.path)?;
-            for s in splits.drain(..) { all_splits.push((idx, s)); }
+            let splits = list_splits_for_uri(&reg.path)?;
+            let total = splits.len();
+            info!(component = "inputs", input_index = idx, input_path = %reg.path, discovered_splits = total, "discovered input splits");
+            // Log first N at info, rest at debug
+            let sample_cap: usize = 100;
+            for (i, s) in splits.iter().enumerate() {
+                if i < sample_cap {
+                    info!(component = "inputs", input_index = idx, split_ordinal = i, split_uri = %s.uri, "input split");
+                } else {
+                    debug!(component = "inputs", input_index = idx, split_ordinal = i, split_uri = %s.uri, "input split (debug)");
+                }
+            }
+            if total > sample_cap {
+                info!(component = "inputs", input_index = idx, remaining = total - sample_cap, "additional input splits omitted from info log; enable debug for full list");
+            }
+            for s in splits.into_iter() { all_splits.push((idx, s)); }
         }
 
         // Determine task topology and plan what this process should do
@@ -571,6 +585,11 @@ where
         let in_path = format!("{}/reduce_in_part{}.tsv", sort_out_dir, r);
         let io_read_start = Instant::now();
         let file = match std::fs::File::open(&in_path) { Ok(f) => f, Err(e) => { error!("open {}: {}", in_path, e); return; } };
+        // If file is empty, skip to avoid mmap on zero-length (can cause SIGBUS on some FS)
+        match file.metadata() { Ok(m) if m.len() == 0 => {
+            info!(phase = "reduce", reducer = r, skipped_empty = true, "reduce input empty, skipping");
+            return;
+        }, _ => {} }
         let map = match unsafe { Mmap::map(&file) } { Ok(m) => m, Err(e) => { error!("mmap {}: {}", in_path, e); return; } };
         let bytes = &map[..];
         let io_read_ms = io_read_start.elapsed().as_millis() as u64;

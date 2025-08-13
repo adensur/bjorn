@@ -220,6 +220,42 @@ impl Format<ParquetRow> for ParquetFormat {
     }
 }
 
+/// Parquet format with simple column projection (filters decoded Row to requested columns).
+/// Note: this currently filters after decoding a row; it does not push down projection to the
+/// Parquet reader yet. For many workloads this still reduces CPU and serialization costs.
+pub struct ParquetFormatProjected { pub columns: std::collections::BTreeSet<String> }
+
+impl ParquetFormatProjected {
+    pub fn new<I: IntoIterator<Item = S>, S: Into<String>>(cols: I) -> Self {
+        let mut set = std::collections::BTreeSet::new();
+        for c in cols { set.insert(c.into()); }
+        Self { columns: set }
+    }
+}
+
+impl Format<ParquetRow> for ParquetFormatProjected {
+    fn decode<'a>(&self, mut r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = ParquetRow> + Send + 'a>> {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut *r, &mut buf)?;
+        let bytes = bytes::Bytes::from(buf);
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(bytes)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let boxed: Box<dyn parquet::file::reader::FileReader> = Box::new(reader);
+        let iter = parquet::record::reader::RowIter::from_file_into(boxed);
+        let cols = self.columns.clone();
+        let rows: Vec<ParquetRow> = iter
+            .map(|row_res| row_to_pqrow(&row_res.unwrap()))
+            .map(|mut m| {
+                if !cols.is_empty() {
+                    m.retain(|k, _| cols.contains(k));
+                }
+                m
+            })
+            .collect();
+        Ok(Box::new(rows.into_iter()))
+    }
+}
+
 /// Trait implemented by user static types to convert into a dynamic ParquetRow.
 pub trait ParquetRecord {
     fn to_row(&self) -> ParquetRow;
@@ -428,6 +464,67 @@ impl Sink<String> for TextLineSink {
     }
 }
 
+// ============== Generic binary line format and sink (length-prefixed bincode<T>) ==============
+
+/// Binary line format: file contains repeated records of [u32 len][bincode<T> bytes]
+pub struct BinaryLineFormat<T> { _phantom: std::marker::PhantomData<T> }
+
+impl<T> Default for BinaryLineFormat<T> { fn default() -> Self { Self { _phantom: std::marker::PhantomData } } }
+
+impl<T> Format<T> for BinaryLineFormat<T>
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+{
+    fn decode<'a>(&self, r: Box<dyn Read + Send + 'a>) -> Result<Box<dyn Iterator<Item = T> + Send + 'a>> {
+        // Read entire stream into memory, then parse length-prefixed records
+        let mut rd = BufReader::new(r);
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut rd, &mut buf)?;
+        let mut out: Vec<T> = Vec::new();
+        let mut off: usize = 0;
+        while off + 4 <= buf.len() {
+            let len = u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]) as usize;
+            off += 4;
+            if off + len > buf.len() { break; }
+            let rec = &buf[off..off+len];
+            off += len;
+            match bincode::deserialize::<T>(rec) { Ok(v) => out.push(v), Err(_e) => {} }
+        }
+        Ok(Box::new(out.into_iter()))
+    }
+}
+
+pub struct BinaryLineSink<T> { pub base: String, _phantom: std::marker::PhantomData<T> }
+
+impl<T> BinaryLineSink<T> { pub fn new(base: impl Into<String>) -> Self { Self { base: base.into(), _phantom: std::marker::PhantomData } } }
+
+pub struct BinaryLineWriter<T> { inner: BufWriter<File>, _phantom: std::marker::PhantomData<T> }
+
+impl<T> PartitionWriter<T> for BinaryLineWriter<T>
+where
+    T: Serialize + Send,
+{
+    fn write(&mut self, record: &T) -> Result<()> {
+        let payload = bincode::serialize(record)?;
+        let len = payload.len() as u32;
+        self.inner.write_all(&len.to_le_bytes())?;
+        self.inner.write_all(&payload)?;
+        Ok(())
+    }
+}
+
+impl<T> Sink<T> for BinaryLineSink<T>
+where
+    T: Serialize + Send + Sync + 'static,
+{
+    type Writer = BinaryLineWriter<T>;
+    fn open_partition(&self, partition_index: usize) -> Result<Self::Writer> {
+        let path = format!("{}/part-{:05}.bin", self.base, partition_index);
+        let w = open_writer(path)?;
+        Ok(BinaryLineWriter { inner: w, _phantom: std::marker::PhantomData })
+    }
+}
+
 /// List splits for a given input URI by delegating to the appropriate source implementation.
 /// Supports local filesystem paths and `s3://` URIs.
 pub fn list_splits_for_uri(input: &str) -> Result<Vec<Split>> {
@@ -466,7 +563,13 @@ impl Source for S3Source {
                 let mut req = client.list_objects_v2().bucket(&me.bucket).prefix(&me.prefix);
                 if let Some(token) = cont.clone() { req = req.continuation_token(token); }
                 let resp = req.send().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                for obj in resp.contents() { if let Some(key) = obj.key() { splits.push(Split { uri: format!("s3://{}/{}", me.bucket, key), byte_range: None, meta: None }); } }
+                for obj in resp.contents() {
+                    if let Some(key) = obj.key() {
+                        // Skip directory markers (keys ending with '/')
+                        if key.ends_with('/') { continue; }
+                        splits.push(Split { uri: format!("s3://{}/{}", me.bucket, key), byte_range: None, meta: None });
+                    }
+                }
                 cont = resp.next_continuation_token().map(|s| s.to_string());
                 if cont.is_none() { break; }
             }
@@ -476,14 +579,34 @@ impl Source for S3Source {
     }
     fn open_split(&self, split: &Split) -> Result<Box<dyn Read + Send>> {
         let key_full = split.uri.strip_prefix("s3://").unwrap_or(&split.uri);
-        let (_bucket, key) = key_full.split_once('/').unwrap_or((&self.bucket, key_full));
+        let (bucket, key) = key_full.split_once('/').unwrap_or((&self.bucket, key_full));
+        // Sanity: skip directory marker keys
+        if key.ends_with('/') {
+            return Err(anyhow::anyhow!(format!("s3 key appears to be a directory marker: s3://{}/{}", bucket, key)));
+        }
         let rt = tokio::runtime::Runtime::new()?;
+        let bucket_owned = bucket.to_string();
+        let key_owned = key.to_string();
         let data = rt.block_on(async move {
             let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let client = aws_sdk_s3::Client::new(&conf);
-            let resp = client.get_object().bucket(&self.bucket).key(key).send().await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let bytes = resp.body.collect().await.map_err(|e| anyhow::anyhow!(e.to_string()))?.into_bytes();
-            Ok::<_, anyhow::Error>(bytes)
+            // Simple retry loop for transient streaming errors
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 0..3 {
+                match client.get_object().bucket(&bucket_owned).key(&key_owned).send().await {
+                    Ok(resp) => {
+                        match resp.body.collect().await {
+                            Ok(agg) => return Ok::<_, anyhow::Error>(agg.into_bytes()),
+                            Err(e) => { last_err = Some(anyhow::anyhow!(e.to_string())); }
+                        }
+                    }
+                    Err(e) => { last_err = Some(anyhow::anyhow!(e.to_string())); }
+                }
+                // backoff
+                let delay_ms = 200u64 * (attempt + 1) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("unknown s3 get_object error")))
         })?;
         Ok(Box::new(std::io::Cursor::new(data)))
     }

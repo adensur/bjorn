@@ -20,7 +20,7 @@ struct Args {
     /// Output directory for JSONL
     #[arg(long)]
     output: String,
-    /// Name of the document body column (e.g. body_full, vespa_body_full)
+    /// Name of the document body column
     #[arg(long, default_value = "body_full")]
     body_colname: String,
     /// Minimum position considered positive (inclusive lower bound of negatives).
